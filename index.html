@@ -1,0 +1,1548 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>HypotheekCheck Pro</title>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; background: #0a0d14; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useMemo } = React;
+
+
+const CSS = `
+  @import url('https://fonts.googleapis.com/css2?family=Lora:wght@500;600;700&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  ::-webkit-scrollbar { width: 5px; background: #0a0d14; }
+  ::-webkit-scrollbar-thumb { background: #1e2433; border-radius: 4px; }
+  input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; }
+  input[type=range] { -webkit-appearance: none; height: 4px; background: #1e2433; border-radius: 2px; outline: none; cursor: pointer; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 16px; border-radius: 50%; background: #c9a84c; cursor: pointer; }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+  .card { animation: fadeUp 0.3s ease both; }
+  select { appearance: none; }
+`;
+
+const C = {
+  bg:"#0a0d14", surface:"#0f1218", s2:"#151a24", s3:"#1a2030",
+  border:"#1e2433",
+  gold:"#c9a84c", goldDim:"#c9a84c22",
+  green:"#3fb950", greenDim:"#3fb95018",
+  red:"#f85149", redDim:"#f8514918",
+  yellow:"#d29922", yellowDim:"#d2992218",
+  blue:"#58a6ff", blueDim:"#58a6ff18",
+  purple:"#bc8cff", purpleDim:"#bc8cff18",
+  teal:"#39d0b0", tealDim:"#39d0b018",
+  orange:"#ff9f43", orangeDim:"#ff9f4318",
+  text:"#e6edf3", sub:"#7d8590", muted:"#3d4450",
+};
+
+// ─── MATH ─────────────────────────────────────────────────────────────────────
+const clamp = (v,a,b) => Math.max(a,Math.min(b,v));
+const € = (v,d=0) => new Intl.NumberFormat("nl-NL",{style:"currency",currency:"EUR",maximumFractionDigits:d}).format(v||0);
+const pct = (v,d=1) => `${Number(v||0).toFixed(d)}%`;
+
+function annML(P,r,n){ if(!P||!n) return 0; const rm=r/100/12,nm=n*12; if(rm===0) return P/nm; return(P*rm*Math.pow(1+rm,nm))/(Math.pow(1+rm,nm)-1); }
+function linML(P,n,r,betaaldJaar){ const rm=r/100/12; const rs=Math.max(0,P-(P/(n*12))*betaaldJaar*12); return P/(n*12)+rs*rm; }
+function rs(P,r,n,betaald){ if(P<=0||n<=0) return 0; const rm=r/100/12,bm=betaald*12,nm=n*12; if(rm===0) return Math.max(0,P-(P/nm)*bm); const mL=annML(P,r,n); return Math.max(0,P*Math.pow(1+rm,bm)-mL*((Math.pow(1+rm,bm)-1)/rm)); }
+function totRente(P,r,n,type){ const nm=n*12; if(type==="lin"){ const mA=P/nm; let rnt=0,rest=P; for(let i=0;i<nm;i++){rnt+=rest*(r/100/12);rest-=mA;} return rnt; } return annML(P,r,n)*nm-P; }
+function extraAflosSim(P,r,n,extra){ const rm=r/100/12,mL=annML(P,r,n); let rest=P,maanden=0,rnt=0; while(rest>0.01&&maanden<n*12*2){const rd=rest*rm;const ad=mL-rd+extra;rnt+=rd;rest-=ad;maanden++;} return{maanden,rnt}; }
+
+// Simplified Dutch net income 2025
+function nettoInkomen(bruto){
+  const hk = Math.min(Math.max(0, bruto*0.028 + 821), 5454); // arbeidskorting approx
+  const ahk = Math.max(0, 3362 - Math.max(0,(bruto-24813)*0.06));
+  let belasting = 0;
+  if(bruto<=38441) belasting=bruto*0.3582;
+  else if(bruto<=75518) belasting=38441*0.3582+(bruto-38441)*0.3748;
+  else belasting=38441*0.3582+(75518-38441)*0.3748+(bruto-75518)*0.495;
+  return Math.max(0, bruto-belasting+hk+ahk);
+}
+
+// Eigenwoningforfait 2025
+function ewf(wozWaarde, heeftHypotheek){
+  if(wozWaarde<=12500) return 0;
+  const base = wozWaarde<=75000 ? wozWaarde*0.0012 : wozWaarde<=1310000 ? wozWaarde*0.0035 : wozWaarde*0.0235;
+  // Wet Hillen: als rente < EWF, dan bijtelling. Als geen hypotheek: volledig bijtelling
+  return base;
+}
+
+// Box 3 belasting 2025 (forfaitair: 6.17% rendement, 36% belasting = effectief 2.22%)
+function box3Belasting(vermogen, fiscaalPartner){
+  const vrijstelling = fiscaalPartner ? 114000 : 57000;
+  const belastbaarVermogen = Math.max(0, vermogen - vrijstelling);
+  return belastbaarVermogen * 0.0217; // effectief tarief ~2.17%
+}
+
+// ─── ATOMS ───────────────────────────────────────────────────────────────────
+const Badge = ({ok,lo,lno}) => <span style={{background:ok?C.greenDim:C.redDim,color:ok?C.green:C.red,borderRadius:20,padding:"3px 11px",fontSize:11,fontWeight:600,letterSpacing:0.4,whiteSpace:"nowrap"}}>{ok?(lo||"✓ OK"):(lno||"✗ Risico")}</span>;
+const Bar = ({value,max=100,t=[35,50]}) => { const p=clamp((value/max)*100,0,100),color=value>t[1]?C.red:value>t[0]?C.yellow:C.green; return <div style={{background:C.s3,borderRadius:6,height:7,overflow:"hidden",marginTop:7}}><div style={{width:`${p}%`,height:"100%",background:color,borderRadius:6,transition:"width .5s ease"}}/></div>; };
+
+function Field({label,value,onChange,pre,suf,step="1",hint,min,max}){
+  return <div style={{display:"flex",flexDirection:"column",gap:4}}>
+    <label style={{fontSize:10,fontWeight:600,color:C.muted,letterSpacing:1.2,textTransform:"uppercase"}}>{label}</label>
+    <div style={{display:"flex",alignItems:"center",background:C.s2,border:`1px solid ${C.border}`,borderRadius:8}}>
+      {pre&&<span style={{padding:"0 9px",color:C.muted,fontSize:13,flexShrink:0}}>{pre}</span>}
+      <input type="number" value={value} step={step} min={min} max={max}
+        onChange={e=>onChange(e.target.value===""?"":parseFloat(e.target.value))}
+        style={{flex:1,background:"transparent",border:"none",outline:"none",color:C.text,padding:"9px",fontSize:14,fontFamily:"inherit",minWidth:0}}/>
+      {suf&&<span style={{padding:"0 9px",color:C.muted,fontSize:13,flexShrink:0}}>{suf}</span>}
+    </div>
+    {hint&&<span style={{fontSize:10,color:C.muted}}>{hint}</span>}
+  </div>;
+}
+
+function Sel({label,value,onChange,opts,hint}){
+  return <div style={{display:"flex",flexDirection:"column",gap:4}}>
+    <label style={{fontSize:10,fontWeight:600,color:C.muted,letterSpacing:1.2,textTransform:"uppercase"}}>{label}</label>
+    <div style={{position:"relative"}}>
+      <select value={value} onChange={e=>onChange(e.target.value)} style={{width:"100%",background:C.s2,border:`1px solid ${C.border}`,borderRadius:8,color:C.text,padding:"9px 32px 9px 9px",fontSize:14,fontFamily:"inherit",cursor:"pointer"}}>
+        {opts.map(o=><option key={o.v} value={o.v}>{o.l}</option>)}
+      </select>
+      <span style={{position:"absolute",right:9,top:"50%",transform:"translateY(-50%)",color:C.muted,pointerEvents:"none",fontSize:10}}>▼</span>
+    </div>
+    {hint&&<span style={{fontSize:10,color:C.muted}}>{hint}</span>}
+  </div>;
+}
+
+function Toggle({value,onChange,opts}){
+  return <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+    {opts.map(o=><button key={o.v} onClick={()=>onChange(o.v)} style={{padding:"6px 13px",borderRadius:7,border:`1px solid ${value===o.v?C.gold:C.border}`,background:value===o.v?C.goldDim:"transparent",color:value===o.v?C.gold:C.sub,cursor:"pointer",fontSize:12,fontWeight:600,fontFamily:"inherit",transition:"all .2s"}}>{o.l}</button>)}
+  </div>;
+}
+
+function Sec({title,children,delay=0}){
+  return <div className="card" style={{background:C.surface,borderRadius:13,border:`1px solid ${C.border}`,padding:20,animationDelay:`${delay}ms`}}>
+    <h3 style={{margin:"0 0 16px",fontSize:11,fontWeight:600,color:C.sub,textTransform:"uppercase",letterSpacing:1.3}}>{title}</h3>
+    {children}
+  </div>;
+}
+
+function G({cols="repeat(auto-fit,minmax(155px,1fr))",gap=13,children}){ return <div style={{display:"grid",gridTemplateColumns:cols,gap}}>{children}</div>; }
+
+function Row({label,value,accent,bold,sub}){
+  return <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-end",padding:"7px 0",borderBottom:`1px solid ${C.border}`}}>
+    <span style={{fontSize:12,color:C.sub}}>{label}</span>
+    <div style={{textAlign:"right"}}>
+      <span style={{fontSize:13,fontWeight:bold?700:500,color:accent||C.text}}>{value}</span>
+      {sub&&<div style={{fontSize:10,color:C.muted}}>{sub}</div>}
+    </div>
+  </div>;
+}
+
+function KPI({label,value,sub,color=C.gold,small}){
+  return <div style={{background:C.s2,borderRadius:11,padding:"12px 14px",textAlign:"center"}}>
+    <div style={{fontSize:small?16:21,fontWeight:700,color,fontFamily:"'Lora',serif",lineHeight:1.1}}>{value}</div>
+    <div style={{fontSize:11,fontWeight:600,color:C.text,marginTop:5}}>{label}</div>
+    {sub&&<div style={{fontSize:10,color:C.muted,marginTop:2}}>{sub}</div>}
+  </div>;
+}
+
+function Alert({type="info",children}){
+  const m={ok:[C.greenDim,C.green,"✅"],warn:[C.yellowDim,C.yellow,"⚠️"],bad:[C.redDim,C.red,"🚨"],info:[C.blueDim,C.blue,"💡"]};
+  const[bg,clr,ico]=m[type];
+  return <div style={{background:bg,border:`1px solid ${clr}30`,borderRadius:9,padding:"10px 13px",fontSize:12,color:clr,lineHeight:1.7,marginTop:11}}>{ico} {children}</div>;
+}
+
+function ScCard({icon,title,accent=C.blue,children,delay=0}){
+  return <div className="card" style={{background:C.surface,borderRadius:13,border:`1px solid ${C.border}`,overflow:"hidden",animationDelay:`${delay}ms`}}>
+    <div style={{background:`linear-gradient(135deg,${accent}12 0%,transparent 60%)`,borderBottom:`1px solid ${C.border}`,padding:"13px 18px",display:"flex",alignItems:"center",gap:9}}>
+      <span style={{fontSize:19}}>{icon}</span>
+      <h3 style={{margin:0,fontSize:14,fontWeight:600,color:C.text,fontFamily:"'Lora',serif"}}>{title}</h3>
+    </div>
+    <div style={{padding:18}}>{children}</div>
+  </div>;
+}
+
+function WQ({value,label="Woonquote",ok,t=[38,50]}){
+  const color=value>t[1]?C.red:value>t[0]?C.yellow:C.green;
+  return <div style={{marginTop:13}}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
+      <span style={{fontSize:12,color:C.sub}}>{label}</span>
+      <div style={{display:"flex",gap:8,alignItems:"center"}}>
+        <span style={{fontSize:17,fontWeight:700,fontFamily:"'Lora',serif",color}}>{pct(value)}</span>
+        <Badge ok={ok??value<42}/>
+      </div>
+    </div>
+    <Bar value={value} max={80} t={t}/>
+    <div style={{display:"flex",justifyContent:"space-between",marginTop:3,fontSize:9,color:C.muted}}>
+      <span>0%</span><span style={{color:C.green}}>35%</span><span style={{color:C.yellow}}>42%</span><span style={{color:C.red}}>60%+</span>
+    </div>
+  </div>;
+}
+
+// Priority matrix badge
+function Prio({level}){
+  const map={kritiek:[C.red,"Kritiek"],hoog:[C.orange,"Hoog"],middel:[C.yellow,"Middel"],laag:[C.green,"Laag"]};
+  const[c,l]=map[level]||[C.sub,"Onbekend"];
+  return <span style={{background:`${c}22`,color:c,borderRadius:6,padding:"2px 8px",fontSize:10,fontWeight:700,letterSpacing:0.5}}>{l}</span>;
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+function App(){
+  const [tab,setTab]=useState("gegevens");
+
+  // Hypotheek
+  const [hs,setHs]=useState(350000);
+  const [ww,setWw]=useState(430000);
+  const [rente,setRente]=useState(4.2);
+  const [lp,setLp]=useState(30);
+  const [rvp,setRvp]=useState(10);
+  const [betaald,setBetaald]=useState(3);
+  const [htype,setHtype]=useState("ann");
+  const [nhg,setNhg]=useState("nee");
+  const [aflVrij,setAflVrij]=useState(0);       // aflossingsvrij deel
+  const [aflVrijRente,setAflVrijRente]=useState(4.2);
+  const [spaarkapitaal,setSpaarkapitaal]=useState(0); // opgebouwd kapitaal spaarhyp
+  const [vve,setVve]=useState(0);
+  const [erfpacht,setErfpacht]=useState("nee");
+  const [epCanon,setEpCanon]=useState(2400);
+  const [epHerziening,setEpHerziening]=useState(10);
+  const [epStijging,setEpStijging]=useState(30);
+  const [gemeenteLasten,setGemeenteLasten]=useState(1100); // OZB+riool+afval
+  const [opstal,setOpstall]=useState(600);       // opstalverzekering/jr
+  const [wozWaarde,setWozWaarde]=useState(410000);
+
+  // Inkomen
+  const [ink1,setInk1]=useState(68000);
+  const [ink2,setInk2]=useState(42000);
+  const [l1,setL1]=useState(38);
+  const [l2,setL2]=useState(36);
+  const [dv1,setDv1]=useState("vast");
+  const [dv2,setDv2]=useState("vast");
+  const [bonus1,setBonus1]=useState(5000);
+  const [bonusZeker,setBonusZeker]=useState("nee");
+  const [zzpOmzet,setZzpOmzet]=useState(90000); // bruto omzet ZZP
+
+  // Verzekeringen
+  const [orv1,setOrv1]=useState("nee");
+  const [orvB1,setOrvB1]=useState(200000);
+  const [orv2,setOrv2]=useState("nee");
+  const [orvB2,setOrvB2]=useState(150000);
+  const [aov,setAov]=useState("nee");
+  const [aovPct,setAovPct]=useState(80);
+  const [wlv,setWlv]=useState("nee");
+  const [wlvMnd,setWlvMnd]=useState(12);
+
+  // Buffer & vermogen
+  const [spaar,setSpaar]=useState(25000);
+  const [beleg,setBeleg]=useState(15000);
+  const [belegRendement,setBelegRendement]=useState(7); // verwacht rendement %
+
+  // Gezin
+  const [kinderen,setKinderen]=useState(0);
+  const [kindKosten,setKindKosten]=useState(800);
+  const [kindLeeftijd,setKindLeeftijd]=useState(8);
+  const [studBijdrage,setStudBijdrage]=useState(500);
+
+  // Woning extra
+  const [energieLabel,setEnergieLabel]=useState("C");
+  const [klimaatzone,setKlimaatzone]=useState("geen");
+  const [dubbeleLasten,setDubbeleLasten]=useState(0);
+  const [overbrug,setOverbrug]=useState(0);
+  const [verduurzaming,setVerduurzaming]=useState(20000);
+
+  // Scenario instellingen
+  const [minderPct,setMinderPct]=useState(20);
+  const [pensioenInk,setPensioenInk]=useState(30000);
+  const [nieuweRente,setNieuweRente]=useState(5.5);
+  const [stressRente,setStressRente]=useState(8.0);
+  const [wwMnd,setWwMnd]=useState(18);
+  const [wwPct,setWwPct]=useState(75);
+  const [wwdaling,setWwdaling]=useState(15);
+  const [extraAflospm,setExtraAflospm]=useState(200);
+  const [overslBoete,setOverslBoete]=useState(3000);
+  const [overslNieuweR,setOverslNieuweR]=useState(3.8);
+  const [loongroei,setLoongroei]=useState(2.5);
+  const [inflatie,setInflatie]=useState(3.0);
+
+  // Externe bronnen
+  const [extPostcode,setExtPostcode]=useState("1234AB");
+  const [extHuisnr,setExtHuisnr]=useState("1");
+  const [extLoading,setExtLoading]=useState(false);
+  const [extStatus,setExtStatus]=useState("");
+  const [extAiData,setExtAiData]=useState(null);
+  // Klimaatcijfer (1=laag, 10=hoog risico)
+  const [klimWater,setKlimWater]=useState(3);
+  const [klimOverstr,setKlimOverstr]=useState(2);
+  const [klimDroogte,setKlimDroogte]=useState(4);
+  const [klimHitte,setKlimHitte]=useState(4);
+  // Funderingscijfer
+  const [fundLabel,setFundLabel]=useState("C");
+  const [fundType,setFundType]=useState("beton");
+  const [fundBouwjaar,setFundBouwjaar]=useState(1975);
+  // Woningcijfer
+  const [wonScore,setWonScore]=useState(7);
+  const [wonLeef,setWonLeef]=useState(7);
+  const [wonVoorz,setWonVoorz]=useState(6);
+  // Hypotheekcijfer
+  const [marktRente,setMarktRente]=useState(3.9);
+
+  // ─── BEREKENINGEN ──────────────────────────────────────────────────────────
+  const c = useMemo(()=>{
+    // Inkomen
+    const inkBruto1 = dv1==="zzp" ? zzpOmzet*0.70 : ink1; // ZZP fiscaal inkomen ~70% omzet
+    const inkBruto2 = ink2;
+    const inkNetto1 = nettoInkomen(inkBruto1);
+    const inkNetto2 = nettoInkomen(inkBruto2);
+    const inkBrutoT = inkBruto1+inkBruto2;
+    const inkNettoT = inkNetto1+inkNetto2;
+    const inkBrutoM = inkBrutoT/12;
+    const inkNettoM = inkNettoT/12;
+
+    // Hypotheek basis
+    const annDeel = Math.max(0, hs-aflVrij);
+    const rsAnn = rs(annDeel, rente, lp, betaald);
+    const rsAflVrij = aflVrij; // aflossingsvrij: schuld blijft gelijk
+    const rsTotaal = rsAnn + rsAflVrij - spaarkapitaal;
+    const rLp = lp-betaald;
+    const mLAnn = htype==="ann" ? annML(annDeel,rente,lp) : linML(annDeel,lp,rente,betaald);
+    const mLAflVrij = aflVrij*(aflVrijRente/100/12); // alleen rente
+    const mL = mLAnn + mLAflVrij;
+    const ltv = (rsTotaal/ww)*100;
+    const overwaarde = ww-rsTotaal;
+    const onderhoud = ww*0.015/12;
+    const nhgMog = hs<=435000&&ww<=435000&&aflVrij===0;
+
+    // Totale woonlast
+    const canonMnd = erfpacht==="ja" ? epCanon/12 : 0;
+    const gemeenteMnd = gemeenteLasten/12;
+    const opstalMnd = opstal/12;
+    const labelKosten = {"A++":-80,"A+":-60,"A":-40,"B":-20,"C":0,"D":40,"E":80,"F":120,"G":180};
+    const energieExtra = labelKosten[energieLabel]||0;
+    const totWoonlast = mL+vve+canonMnd+gemeenteMnd+opstalMnd+energieExtra;
+    const wqBruto = (mL/inkBrutoM)*100;
+    const totWqBruto = (totWoonlast/inkBrutoM)*100;
+    const totWqNetto = (totWoonlast/inkNettoM)*100;
+
+    // Buffer
+    const bufTot = spaar+beleg;
+    const bufMnd = mL>0 ? bufTot/mL : 0;
+
+    // Renteaftrek
+    const renteJaar = rsTotaal*(rente/100);
+    const aftrekVoordeel = renteJaar*0.3697/12;
+    const nettoML = mL-aftrekVoordeel;
+    const nettoWq = (nettoML/inkBrutoM)*100;
+
+    // Eigenwoningforfait
+    const ewfBedrag = ewf(wozWaarde, ink2>0);
+    const ewfMaand = ewfBedrag/12;
+    // Als renteaftrek < EWF: bijtelling (Wet Hillen afgebouwd 2019-2048, nu 80% voordeel)
+    const renteAftrekJaar = renteJaar*0.3697;
+    const hillenBijtelling = Math.max(0, ewfBedrag - renteAftrekJaar)*0.20; // 20% bijtelling nu
+    const fiscaalVoordeel = renteAftrekJaar - ewfBedrag - hillenBijtelling;
+    const nettoMlFiscaal = mL - fiscaalVoordeel/12;
+
+    // Box 3 vermogen
+    const vermogen = spaar+beleg;
+    const box3Btg = box3Belasting(vermogen, ink2>0);
+    const box3Mnd = box3Btg/12;
+
+    // Totale rentekosten
+    const totRAnn = totRente(annDeel,rente,lp,"ann");
+    const totRLin = totRente(annDeel,rente,lp,"lin");
+
+    // Netto cashflow
+    const vasteLasten = totWoonlast+onderhoud;
+    const kindMnd = kinderen*kindKosten;
+    const netCashflow = inkNettoM - vasteLasten - kindMnd;
+    const netCashflowPct = (vasteLasten/inkNettoM)*100;
+
+    // Bonus wegval
+    const inkZonderBonus = (inkBruto1-(bonusZeker==="nee"?bonus1:0)+inkBruto2)/12;
+    const bonusWq = (mL/inkZonderBonus)*100;
+
+    // Ziektewet
+    const zwInk1 = inkBruto1*0.70/12;
+    const zwTotM = zwInk1+inkBruto2/12;
+    const zwWq = (mL/zwTotM)*100;
+
+    // Zwangerschap (na verlof 80%)
+    const zdNaInkM = (inkBruto1*0.80+inkBruto2)/12;
+    const zdNaWq = (mL/zdNaInkM)*100;
+
+    // AO
+    const aoInk1 = aov==="ja" ? inkBruto1*(aovPct/100) : inkBruto1*0.70;
+    const aoTotM = (aoInk1+inkBruto2)/12;
+    const aoWq = (mL/aoTotM)*100;
+
+    // Overlijden
+    const rsOrv1 = Math.max(0,rsTotaal-(orv1==="ja"?orvB1:0));
+    const mLOrv1 = annML(rsOrv1,rente,rLp);
+    const ovlWq1 = (mLOrv1/(inkBruto2/12))*100;
+    const rsOrv2 = Math.max(0,rsTotaal-(orv2==="ja"?orvB2:0));
+    const mLOrv2 = annML(rsOrv2,rente,rLp);
+    const ovlWq2 = (mLOrv2/(inkBruto1/12))*100;
+
+    // ANW uitkering (nabestaanden): bruto ~€1.466/mnd (2025), alleen als geen eigen inkomen >50% minimumloon
+    const anwUitkering = 1466;
+    const ovlWq1MetAnw = (mLOrv1/((inkBruto2/12)+anwUitkering))*100;
+
+    // Minder werken
+    const minderInkM = inkBrutoM*(1-minderPct/100);
+    const minderWq = (mL/minderInkM)*100;
+
+    // Mantelzorg
+    const mantelWq = (mL/(inkBruto1/12))*100;
+
+    // Studie
+    const jaarTotStudie = Math.max(0,18-kindLeeftijd);
+    const studieKosten = kinderen*studBijdrage;
+    const vrijNaStudie = inkNettoM-mL-studieKosten;
+
+    // Pensioen
+    const AOW=67;
+    const jTotP = AOW-Math.min(l1,l2||l1);
+    const rsPensioen = rs(annDeel,rente,lp,betaald+Math.max(0,jTotP));
+    const rLpPensioen = Math.max(0,rLp-jTotP);
+    const mLPensioen = rsPensioen>0 ? annML(rsPensioen,rente,rLpPensioen) : 0;
+    const pensMnd = pensioenInk/12;
+    const pensWq = mLPensioen>0 ? (mLPensioen/pensMnd)*100 : 0;
+
+    // Nieuwe rente
+    const rsNvp = rs(annDeel,rente,lp,rvp);
+    const rLpNvp = lp-rvp;
+    const mLNvp = annML(rsNvp,nieuweRente,rLpNvp)+mLAflVrij;
+    const nvpWq = (mLNvp/inkBrutoM)*100;
+    const nvpDelta = mLNvp-mL;
+
+    // Stress test
+    const mLStress = annML(rsAnn,stressRente,rLp)+mLAflVrij;
+    const stressWq = (mLStress/inkBrutoM)*100;
+    const stressDelta = mLStress-mL;
+
+    // Inflatie / loongroei
+    const inkM10 = inkBrutoM*Math.pow(1+loongroei/100,10);
+    const wqOver10 = (mL/inkM10)*100;
+    const reeleSchuld10 = rsTotaal/Math.pow(1+inflatie/100,10);
+
+    // Werkloosheid
+    const wwInk1 = inkBruto1*(wwPct/100)/12;
+    const wwTotM = wwInk1+inkBruto2/12;
+    const wwWq = (mL/wwTotM)*100;
+
+    // Scheiding
+    const schWq1 = (mL/(inkBruto1/12))*100;
+    const schWq2 = inkBruto2>0 ? (mL/(inkBruto2/12))*100 : 999;
+
+    // Woningwaardedaling
+    const wwNaDaling = ww*(1-wwdaling/100);
+    const ltvNaDaling = (rsTotaal/wwNaDaling)*100;
+    const onderWater = rsTotaal>wwNaDaling;
+    const onderwaterBij = (1-(rsTotaal/ww))*100;
+    const restschuldVerkoop = Math.max(0,rsTotaal-wwNaDaling*0.93);
+
+    // Dubbele lasten
+    const totDubbel = mL+dubbeleLasten;
+    const dubbelWq = (totDubbel/inkBrutoM)*100;
+    const dubbelMnd = bufTot>0&&dubbeleLasten>0 ? (bufTot/totDubbel).toFixed(1) : 0;
+
+    // Erfpacht herziening
+    const canonNieuw = erfpacht==="ja" ? (epCanon*(1+epStijging/100))/12 : 0;
+    const canonDelta = canonNieuw-canonMnd;
+    const epWqNa = erfpacht==="ja" ? ((mL+canonNieuw)/inkBrutoM)*100 : 0;
+
+    // Overbruggingskrediet
+    const obRente = overbrug*(rente/100/12);
+    const obWq = overbrug>0 ? ((mL+obRente)/inkBrutoM)*100 : wqBruto;
+
+    // Klimaat
+    const klimaatKorting={geen:0,laag:0.02,matig:0.05,hoog:0.12};
+    const klimaatDaling = ww*(klimaatKorting[klimaatzone]||0);
+    const ltvNaKlimaat = (rsTotaal/(ww-klimaatDaling))*100;
+
+    // Extra aflossen
+    const normaalSim = extraAflosSim(rsAnn,rente,rLp,0);
+    const extraSim = extraAflospm>0 ? extraAflosSim(rsAnn,rente,rLp,extraAflospm) : null;
+    const extraBesparing = extraSim ? normaalSim.rnt-extraSim.rnt : 0;
+    const extraKorting = extraSim ? (normaalSim.maanden-extraSim.maanden)/12 : 0;
+
+    // Oversluiten
+    const ovslBesp = annML(rsAnn,rente,lp)-annML(rsAnn,overslNieuweR,rLp);
+    const ovslTerugverdien = ovslBesp>0 ? Math.ceil(overslBoete/ovslBesp) : Infinity;
+    const ovslZinvol = ovslBesp>0&&ovslTerugverdien<rLp*12*0.5;
+
+    // Extra aflossen vs. beleggen
+    const aflBreakEven = belegRendement; // breakeven rendement waarbij beleggen = aflossen
+    const rendementNaBalsting = belegRendement*(1-0.3697); // rendement na belasting (vereenvoudigd)
+    const aflRenteNaAftrek = rente*(1-0.3697);
+    const aflVsBelegBeter = rendementNaBalsting > aflRenteNaAftrek;
+    const extraPm10Belegg = (() => {
+      let v = 0;
+      for(let i=0;i<120;i++) v=(v+extraAflospm)*(1+belegRendement/100/12);
+      return v;
+    })();
+    const extraPm10Aflos = extraAflospm*120+(extraBesparing*(Math.min(10,extraKorting)/Math.max(1,extraKorting)));
+
+    // Verduurzaming
+    const vdBespMnd = verduurzaming>0 ? Math.min(verduurzaming*0.007/12,250) : 0;
+    const vdRoi = verduurzaming>0 ? (vdBespMnd*12/verduurzaming)*100 : 0;
+    const vdTerugverdien = vdBespMnd>0 ? verduurzaming/(vdBespMnd*12) : 0;
+
+    // Aflossingsvrij analyse
+    const aflVrijRisico = aflVrij>0 && (betaald+rLp)>=lp; // nog steeds aflossingsvrij schuld aan einde
+    const aflVrijLtv = aflVrij>0 ? (aflVrij/ww)*100 : 0;
+    const aflVrijPct = hs>0 ? (aflVrij/hs)*100 : 0;
+
+    // Netto cashflow waterval
+    const cashflowItems = [
+      {l:"Netto inkomen",v:inkNettoM,type:"plus"},
+      {l:"Hypotheeklast",v:-mL,type:"min"},
+      {l:"VvE + erfpacht",v:-(vve+canonMnd),type:"min"},
+      {l:"Gemeentelijke lasten",v:-gemeenteMnd,type:"min"},
+      {l:"Opstalverzekering",v:-opstalMnd,type:"min"},
+      {l:"Energiemeerkosten",v:-energieExtra,type:energieExtra>0?"min":"plus"},
+      {l:"Onderhoud (1.5%)",v:-onderhoud,type:"min"},
+      {l:"Box 3 belasting",v:-box3Mnd,type:"min"},
+      {l:"Kindkosten",v:-kindMnd,type:kindMnd>0?"min":"neutraal"},
+      {l:"Vrij besteedbaar",v:netCashflow-box3Mnd,type:"totaal"},
+    ].filter(i=>i.v!==0||i.type==="totaal");
+
+    // Alle scenario's voor overzicht & actiepunten
+    const scenarios=[
+      {ico:"🩺",l:"Arbeidsongeschikt",wq:aoWq,ok:aoWq<42,prio:aoWq>55?"kritiek":aoWq>42?"hoog":"laag"},
+      {ico:"💔",l:"Overlijden partner 1",wq:ovlWq1,ok:ovlWq1<42,prio:ovlWq1>60?"kritiek":ovlWq1>42?"hoog":"laag"},
+      {ico:"💙",l:"Overlijden partner 2",wq:ovlWq2,ok:ovlWq2<42||inkBruto2===0,prio:ovlWq2>60?"hoog":ovlWq2>42?"middel":"laag"},
+      {ico:"🤒",l:"Ziektewet 2 jaar",wq:zwWq,ok:zwWq<50,prio:zwWq>60?"hoog":"middel"},
+      {ico:"🤰",l:"Zwangerschapsverlof",wq:zdNaWq,ok:zdNaWq<45,prio:zdNaWq>55?"hoog":"laag"},
+      {ico:"⏰",l:`Minder werken −${minderPct}%`,wq:minderWq,ok:minderWq<42,prio:minderWq>55?"hoog":"middel"},
+      {ico:"❤️",l:"Mantelzorg P2 stopt",wq:mantelWq,ok:mantelWq<42||inkBruto2===0,prio:mantelWq>55?"hoog":"middel"},
+      {ico:"👶",l:"Kinderkosten",wq:null,ok:netCashflow>=200,prio:netCashflow<0?"kritiek":netCashflow<500?"hoog":"laag"},
+      {ico:"🏖️",l:"Pensioen",wq:pensWq,ok:pensWq<38||rsPensioen===0,prio:pensWq>50?"hoog":"middel"},
+      {ico:"📈",l:`Nieuwe rente ${nieuweRente}%`,wq:nvpWq,ok:nvpWq<42,prio:nvpDelta>400?"hoog":nvpDelta>200?"middel":"laag"},
+      {ico:"🔥",l:`Rente stress ${stressRente}%`,wq:stressWq,ok:stressWq<50,prio:stressWq>65?"hoog":"middel"},
+      {ico:"💼",l:"Werkloosheid WW",wq:wwWq,ok:wwWq<50,prio:(dv1==="zzp"||dv1==="flex")?"kritiek":wwWq>55?"hoog":"middel"},
+      {ico:"⚖️",l:"Scheiding P1 solo",wq:schWq1,ok:schWq1<42,prio:schWq1>60?"hoog":"laag"},
+      {ico:"📉",l:`Woningdaling −${wwdaling}%`,wq:null,ok:!onderWater,prio:onderWater?"kritiek":ltvNaDaling>90?"hoog":"laag"},
+      {ico:"🏗️",l:"Dubbele woonlasten",wq:dubbelWq,ok:dubbelWq<55||dubbeleLasten===0,prio:dubbelWq>70?"hoog":"laag"},
+      {ico:"🎁",l:"Bonus wegval",wq:bonusWq,ok:bonusWq<42||bonus1===0,prio:bonusWq>50&&bonusZeker==="nee"?"hoog":"laag"},
+      {ico:"🏢",l:"Erfpacht herziening",wq:epWqNa,ok:erfpacht==="nee"||epWqNa<42,prio:erfpacht==="ja"&&epWqNa>50?"hoog":"laag"},
+      {ico:"🌊",l:"Klimaatrisico",wq:null,ok:klimaatzone==="geen"||klimaatzone==="laag",prio:klimaatzone==="hoog"?"hoog":klimaatzone==="matig"?"middel":"laag"},
+    ];
+
+    const risicoCount = scenarios.filter(s=>!s.ok).length;
+
+    return{
+      inkBruto1,inkBruto2,inkBrutoT,inkBrutoM,inkNetto1,inkNetto2,inkNettoT,inkNettoM,
+      annDeel,rsAnn,rsAflVrij,rsTotaal,rLp,mLAnn,mLAflVrij,mL,ltv,overwaarde,onderhoud,nhgMog,
+      canonMnd,gemeenteMnd,opstalMnd,energieExtra,totWoonlast,wqBruto,totWqBruto,totWqNetto,
+      bufTot,bufMnd,renteJaar,aftrekVoordeel,nettoML,nettoWq,
+      ewfBedrag,ewfMaand,hillenBijtelling,fiscaalVoordeel,nettoMlFiscaal,
+      box3Btg,box3Mnd,
+      totRAnn,totRLin,
+      netCashflow,netCashflowPct,cashflowItems,vasteLasten,kindMnd,
+      bonusWq,inkZonderBonus,
+      zwInk1,zwTotM,zwWq,zdNaInkM,zdNaWq,
+      aoInk1,aoTotM,aoWq,
+      rsOrv1,mLOrv1,ovlWq1,ovlWq1MetAnw,rsOrv2,mLOrv2,ovlWq2,anwUitkering,
+      minderInkM,minderWq,mantelWq,
+      jaarTotStudie,vrijNaStudie,studieKosten,
+      jTotP,rsPensioen,mLPensioen,pensMnd,pensWq,
+      rsNvp,mLNvp,nvpWq,nvpDelta,
+      mLStress,stressWq,stressDelta,
+      inkM10,wqOver10,reeleSchuld10,
+      wwInk1,wwTotM,wwWq,
+      schWq1,schWq2,
+      wwNaDaling,ltvNaDaling,onderWater,onderwaterBij,restschuldVerkoop,
+      totDubbel,dubbelWq,dubbelMnd,
+      canonNieuw,canonDelta,epWqNa,
+      obRente,obWq,
+      klimaatDaling,ltvNaKlimaat,
+      extraSim,extraBesparing,extraKorting,
+      ovslBesp,ovslTerugverdien,ovslZinvol,
+      aflVsBelegBeter,rendementNaBalsting,aflRenteNaAftrek,extraPm10Belegg,extraPm10Aflos,
+      vdBespMnd,vdRoi,vdTerugverdien,
+      aflVrijRisico,aflVrijLtv,aflVrijPct,
+      scenarios,risicoCount,
+    };
+  },[hs,ww,rente,lp,rvp,betaald,htype,nhg,aflVrij,aflVrijRente,spaarkapitaal,vve,erfpacht,epCanon,epHerziening,epStijging,gemeenteLasten,opstal,wozWaarde,
+     ink1,ink2,l1,l2,dv1,dv2,bonus1,bonusZeker,zzpOmzet,
+     orv1,orvB1,orv2,orvB2,aov,aovPct,wlv,wlvMnd,
+     spaar,beleg,belegRendement,kinderen,kindKosten,kindLeeftijd,studBijdrage,
+     energieLabel,klimaatzone,dubbeleLasten,overbrug,verduurzaming,
+     minderPct,pensioenInk,nieuweRente,stressRente,wwMnd,wwPct,wwdaling,
+     extraAflospm,overslBoete,overslNieuweR,loongroei,inflatie]);
+
+  const tabs=[
+    {id:"gegevens",l:"📋 Gegevens"},
+    {id:"dashboard",l:"📊 Dashboard"},
+    {id:"scenarios",l:"🔍 Scenario's"},
+    {id:"financieel",l:"📈 Rente & Woning"},
+    {id:"fiscaal",l:"💶 Fiscaal & Kosten"},
+    {id:"strategie",l:"🚀 Strategie"},
+    {id:"bescherming",l:"🛡️ Bescherming"},
+    {id:"extern",l:"🌍 Externe Bronnen"},
+    {id:"actiepunten",l:"🎯 Actiepunten"},
+  ];
+
+  return(
+    <div style={{minHeight:"100vh",background:C.bg,fontFamily:"'IBM Plex Sans',sans-serif",color:C.text}}>
+      <style>{CSS}</style>
+
+      {/* HEADER */}
+      <div style={{background:`linear-gradient(180deg,${C.surface} 0%,${C.bg} 100%)`,borderBottom:`1px solid ${C.border}`,padding:"15px 16px"}}>
+        <div style={{maxWidth:1040,margin:"0 auto",display:"flex",alignItems:"center",justifyContent:"space-between",flexWrap:"wrap",gap:10}}>
+          <div style={{display:"flex",alignItems:"center",gap:11}}>
+            <div style={{width:40,height:40,background:`linear-gradient(135deg,${C.gold},#8b6914)`,borderRadius:11,display:"flex",alignItems:"center",justifyContent:"center",fontSize:19,boxShadow:`0 0 18px ${C.goldDim}`}}>🏠</div>
+            <div>
+              <h1 style={{fontSize:18,fontWeight:700,color:C.text,fontFamily:"'Lora',serif",letterSpacing:-0.3}}>HypotheekCheck <span style={{color:C.gold}}>Pro</span></h1>
+              <p style={{fontSize:10,color:C.muted}}>Compleet hypotheek analyse platform · {c.scenarios.length} scenario's</p>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:7,flexWrap:"wrap"}}>
+            {[
+              {l:"Bruto last",v:€(c.mL),col:C.gold},
+              {l:"Netto last",v:€(c.nettoMlFiscaal),col:C.green},
+              {l:"Woonquote",v:pct(c.wqBruto),col:c.wqBruto<35?C.green:c.wqBruto<42?C.yellow:C.red},
+              {l:"Risico's",v:`${c.risicoCount}/${c.scenarios.length}`,col:c.risicoCount===0?C.green:c.risicoCount<=4?C.yellow:C.red},
+            ].map(k=>(
+              <div key={k.l} style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:9,padding:"5px 12px",textAlign:"center"}}>
+                <div style={{fontSize:14,fontWeight:700,color:k.col,fontFamily:"'Lora',serif"}}>{k.v}</div>
+                <div style={{fontSize:9,color:C.muted}}>{k.l}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* TABS */}
+      <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,overflowX:"auto"}}>
+        <div style={{maxWidth:1040,margin:"0 auto",display:"flex"}}>
+          {tabs.map(t=>(
+            <button key={t.id} onClick={()=>setTab(t.id)} style={{background:"none",border:"none",cursor:"pointer",padding:"11px 13px",fontSize:11,fontWeight:600,fontFamily:"inherit",whiteSpace:"nowrap",color:tab===t.id?C.gold:C.sub,borderBottom:`2px solid ${tab===t.id?C.gold:"transparent"}`,transition:"all .2s"}}>
+              {t.l}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{maxWidth:1040,margin:"0 auto",padding:"20px 14px 60px"}}>
+
+        {/* ════ GEGEVENS ═══════════════════════════════════════════════════════ */}
+        {tab==="gegevens"&&(
+          <div style={{display:"grid",gap:14}}>
+            <Sec title="🏦 Hypotheek" delay={0}>
+              <G><Field label="Hypotheekbedrag" value={hs} onChange={setHs} pre="€"/>
+                <Field label="Woningwaarde" value={ww} onChange={setWw} pre="€"/>
+                <Field label="WOZ-waarde" value={wozWaarde} onChange={setWozWaarde} pre="€" hint="Voor EWF-berekening"/>
+                <Field label="Rente" value={rente} onChange={setRente} suf="%" step="0.05"/>
+                <Field label="Looptijd" value={lp} onChange={setLp} suf="jr"/>
+                <Field label="Rentevaste periode" value={rvp} onChange={setRvp} suf="jr"/>
+                <Field label="Al afbetaald" value={betaald} onChange={setBetaald} suf="jr"/>
+              </G>
+              <div style={{display:"flex",gap:18,marginTop:14,flexWrap:"wrap"}}>
+                <div><div style={{fontSize:10,fontWeight:600,color:C.muted,letterSpacing:1.2,textTransform:"uppercase",marginBottom:6}}>Type</div>
+                  <Toggle value={htype} onChange={setHtype} opts={[{v:"ann",l:"Annuïteit"},{v:"lin",l:"Lineair"}]}/></div>
+                <div><div style={{fontSize:10,fontWeight:600,color:C.muted,letterSpacing:1.2,textTransform:"uppercase",marginBottom:6}}>NHG</div>
+                  <Toggle value={nhg} onChange={setNhg} opts={[{v:"ja",l:"Ja"},{v:"nee",l:"Nee"}]}/></div>
+              </div>
+              <div style={{marginTop:14,padding:"12px 14px",background:C.s2,borderRadius:10}}>
+                <div style={{fontSize:11,fontWeight:600,color:C.sub,marginBottom:10}}>🔒 Aflossingsvrij deel</div>
+                <G cols="repeat(auto-fit,minmax(140px,1fr))">
+                  <Field label="Aflossingsvrij bedrag" value={aflVrij} onChange={setAflVrij} pre="€" hint="Max. 50% van woningwaarde"/>
+                  <Field label="Rente aflossingsvrij" value={aflVrijRente} onChange={setAflVrijRente} suf="%" step="0.05"/>
+                  <Field label="Opgebouwd kapitaal" value={spaarkapitaal} onChange={setSpaarkapitaal} pre="€" hint="Spaarhypotheek o.i.d."/>
+                </G>
+                {aflVrij>0&&<Alert type="warn">Aflossingsvrij deel ({€(aflVrij)}) wordt nooit afgelost — schuld blijft bestaan. Op einddatum looptijd moet dit herfinanciert of afgelost worden.</Alert>}
+              </div>
+            </Sec>
+
+            <Sec title="🏠 Woning & Vaste Lasten" delay={30}>
+              <G><Field label="VvE bijdrage p/m" value={vve} onChange={setVve} pre="€"/>
+                <Field label="Gemeentelijke lasten /jr" value={gemeenteLasten} onChange={setGemeenteLasten} pre="€" hint="OZB + riool + afval"/>
+                <Field label="Opstalverzekering /jr" value={opstal} onChange={setOpstall} pre="€"/>
+                <Field label="Verduurzaming investering" value={verduurzaming} onChange={setVerduurzaming} pre="€"/>
+                <Field label="Dubbele last (doorstroom)" value={dubbeleLasten} onChange={setDubbeleLasten} pre="€" suf="/mnd" hint="0 = n.v.t."/>
+                <Field label="Overbruggingskrediet" value={overbrug} onChange={setOverbrug} pre="€" hint="0 = n.v.t."/>
+              </G>
+              <div style={{display:"flex",gap:18,marginTop:14,flexWrap:"wrap"}}>
+                <Sel label="Energielabel" value={energieLabel} onChange={setEnergieLabel} opts={["A++","A+","A","B","C","D","E","F","G"].map(v=>({v,l:`Label ${v}`}))}/>
+                <Sel label="Klimaatrisico" value={klimaatzone} onChange={setKlimaatzone} opts={[{v:"geen",l:"Geen"},{v:"laag",l:"Laag"},{v:"matig",l:"Matig"},{v:"hoog",l:"Hoog"}]}/>
+              </div>
+              <div style={{marginTop:14}}>
+                <div style={{fontSize:10,fontWeight:600,color:C.muted,letterSpacing:1.2,textTransform:"uppercase",marginBottom:6}}>Erfpacht</div>
+                <Toggle value={erfpacht} onChange={setErfpacht} opts={[{v:"ja",l:"Ja"},{v:"nee",l:"Nee"}]}/>
+                {erfpacht==="ja"&&<div style={{marginTop:10}}><G cols="repeat(auto-fit,minmax(140px,1fr))">
+                  <Field label="Canon /jr" value={epCanon} onChange={setEpCanon} pre="€"/>
+                  <Field label="Herziening over" value={epHerziening} onChange={setEpHerziening} suf="jr"/>
+                  <Field label="Verwachte stijging" value={epStijging} onChange={setEpStijging} suf="%"/>
+                </G></div>}
+              </div>
+            </Sec>
+
+            <Sec title="💼 Inkomen" delay={60}>
+              <G cols="1fr 1fr">
+                <div style={{display:"grid",gap:11}}>
+                  <div style={{fontSize:11,fontWeight:600,color:C.gold}}>Persoon 1</div>
+                  <div><div style={{fontSize:10,fontWeight:600,color:C.muted,letterSpacing:1.2,textTransform:"uppercase",marginBottom:6}}>Dienstverband</div>
+                    <Toggle value={dv1} onChange={setDv1} opts={[{v:"vast",l:"Vast"},{v:"flex",l:"Flex"},{v:"zzp",l:"ZZP"}]}/></div>
+                  {dv1==="zzp" ? <Field label="Bruto omzet /jr" value={zzpOmzet} onChange={setZzpOmzet} pre="€" hint="Fiscaal inkomen ~70% omzet"/>
+                    : <Field label="Bruto salaris /jr" value={ink1} onChange={setInk1} pre="€"/>}
+                  <Field label="Jaarbonus (variabel)" value={bonus1} onChange={setBonus1} pre="€" hint="0 = geen bonus"/>
+                  <Field label="Leeftijd" value={l1} onChange={setL1} suf="jr"/>
+                  {bonus1>0&&<div><div style={{fontSize:10,fontWeight:600,color:C.muted,letterSpacing:1.2,textTransform:"uppercase",marginBottom:6}}>Bonus gegarandeerd?</div>
+                    <Toggle value={bonusZeker} onChange={setBonusZeker} opts={[{v:"ja",l:"Ja"},{v:"nee",l:"Nee"}]}/></div>}
+                </div>
+                <div style={{display:"grid",gap:11}}>
+                  <div style={{fontSize:11,fontWeight:600,color:C.sub}}>Persoon 2 <span style={{color:C.muted}}>(0 = alleen)</span></div>
+                  <div><div style={{fontSize:10,fontWeight:600,color:C.muted,letterSpacing:1.2,textTransform:"uppercase",marginBottom:6}}>Dienstverband</div>
+                    <Toggle value={dv2} onChange={setDv2} opts={[{v:"vast",l:"Vast"},{v:"flex",l:"Flex"},{v:"zzp",l:"ZZP"}]}/></div>
+                  <Field label="Bruto salaris /jr" value={ink2} onChange={setInk2} pre="€"/>
+                  <Field label="Leeftijd" value={l2} onChange={setL2} suf="jr"/>
+                </div>
+              </G>
+              <div style={{marginTop:12,padding:"10px 13px",background:C.s2,borderRadius:9,fontSize:12}}>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                  <div><div style={{fontSize:10,color:C.muted,marginBottom:3}}>Netto inkomen P1</div><div style={{fontWeight:700,color:C.green}}>{€(c.inkNetto1)}/jr</div></div>
+                  <div><div style={{fontSize:10,color:C.muted,marginBottom:3}}>Netto inkomen P2</div><div style={{fontWeight:700,color:ink2>0?C.green:C.muted}}>{€(c.inkNetto2)}/jr</div></div>
+                </div>
+              </div>
+            </Sec>
+
+            <Sec title="💰 Buffer, Vermogen & Gezin" delay={90}>
+              <G>
+                <Field label="Spaargeld" value={spaar} onChange={setSpaar} pre="€"/>
+                <Field label="Beleggingen" value={beleg} onChange={setBeleg} pre="€"/>
+                <Field label="Verwacht beleggingsrendement" value={belegRendement} onChange={setBelegRendement} suf="%" step="0.5"/>
+                <Field label="Aantal kinderen" value={kinderen} onChange={setKinderen}/>
+                <Field label="Kosten per kind p/m" value={kindKosten} onChange={setKindKosten} pre="€"/>
+                <Field label="Leeftijd jongste kind" value={kindLeeftijd} onChange={setKindLeeftijd} suf="jr"/>
+                <Field label="Studie bijdrage p/m" value={studBijdrage} onChange={setStudBijdrage} pre="€"/>
+              </G>
+            </Sec>
+
+            <Sec title="⚙️ Scenario-instellingen" delay={120}>
+              <G>
+                <Field label="Minder werken %" value={minderPct} onChange={setMinderPct} suf="%"/>
+                <Field label="Pensioeninkomen /jr" value={pensioenInk} onChange={setPensioenInk} pre="€"/>
+                <Field label="Verwachte nieuwe rente" value={nieuweRente} onChange={setNieuweRente} suf="%" step="0.05"/>
+                <Field label="Stress test rente" value={stressRente} onChange={setStressRente} suf="%" step="0.1"/>
+                <Field label="WW uitkering %" value={wwPct} onChange={setWwPct} suf="%"/>
+                <Field label="Woningwaardedaling %" value={wwdaling} onChange={setWwdaling} suf="%"/>
+                <Field label="Loongroei /jr" value={loongroei} onChange={setLoongroei} suf="%" step="0.1"/>
+                <Field label="Inflatie /jr" value={inflatie} onChange={setInflatie} suf="%" step="0.1"/>
+                <Field label="Extra aflossen p/m" value={extraAflospm} onChange={setExtraAflospm} pre="€"/>
+                <Field label="Oversluiten boete" value={overslBoete} onChange={setOverslBoete} pre="€"/>
+                <Field label="Oversluiten nieuwe rente" value={overslNieuweR} onChange={setOverslNieuweR} suf="%" step="0.05"/>
+              </G>
+            </Sec>
+
+            <button onClick={()=>setTab("actiepunten")} style={{background:`linear-gradient(135deg,${C.gold},#8b6914)`,color:"#07090f",border:"none",borderRadius:11,padding:"12px 26px",fontSize:14,fontWeight:700,cursor:"pointer",fontFamily:"inherit",alignSelf:"flex-start",boxShadow:`0 4px 22px ${C.goldDim}`}}>
+              Volledig analyseren → {c.risicoCount} risico's gevonden
+            </button>
+          </div>
+        )}
+
+        {/* ════ DASHBOARD ════════════════════════════════════════════════════════ */}
+        {tab==="dashboard"&&(
+          <div style={{display:"grid",gap:14}}>
+            <G cols="repeat(auto-fit,minmax(115px,1fr))">
+              <KPI label="Bruto last" value={€(c.mL)} color={C.gold}/>
+              <KPI label="Netto last" value={€(c.nettoMlFiscaal)} sub="na aftrek/EWF" color={C.green}/>
+              <KPI label="Totale woonlast" value={€(c.totWoonlast)} sub="incl. alle lasten" color={C.yellow}/>
+              <KPI label="Restschuld" value={€(c.rsTotaal)} color={C.blue}/>
+              <KPI label="Overwaarde" value={€(c.overwaarde)} color={c.overwaarde>0?C.green:C.red}/>
+              <KPI label="LTV" value={pct(c.ltv)} color={c.ltv<80?C.green:C.yellow}/>
+              <KPI label="Buffer" value={`${c.bufMnd.toFixed(1)}×`} color={c.bufMnd>=6?C.green:c.bufMnd>=3?C.yellow:C.red}/>
+              <KPI label="Risico's" value={`${c.risicoCount}/${c.scenarios.length}`} color={c.risicoCount===0?C.green:c.risicoCount<=4?C.yellow:C.red}/>
+            </G>
+
+            <G cols="1fr 1fr">
+              <Sec title="Woonquotes">
+                {[["Bruto (hypotheek/bruto ink)",c.wqBruto,[35,45]],["Totaal (alle lasten/bruto)",c.totWqBruto,[40,52]],["Totaal (alle lasten/netto)",c.totWqNetto,[45,60]],["Netto (na renteaftrek/EWF)",c.nettoWq,[30,40]]].map(([l,v,t])=>(
+                  <div key={l} style={{marginBottom:10}}>
+                    <div style={{display:"flex",justifyContent:"space-between",fontSize:11,marginBottom:3}}>
+                      <span style={{color:C.sub}}>{l}</span>
+                      <span style={{fontWeight:700,color:v>t[1]?C.red:v>t[0]?C.yellow:C.green}}>{pct(v)}</span>
+                    </div>
+                    <Bar value={v} max={80} t={t}/>
+                  </div>
+                ))}
+              </Sec>
+              <Sec title="Netto cashflow p/m">
+                {c.cashflowItems.map((item,i)=>(
+                  <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"5px 0",borderBottom:`1px solid ${C.border}`,fontSize:12}}>
+                    <span style={{color:item.type==="totaal"?C.text:C.sub}}>{item.l}</span>
+                    <span style={{fontWeight:item.type==="totaal"?700:400,color:item.type==="totaal"?(item.v>=0?C.green:C.red):item.v>=0?C.green:C.red}}>{item.v>=0?"+":""}{€(item.v)}</span>
+                  </div>
+                ))}
+              </Sec>
+            </G>
+
+            <Sec title="Alle scenario's">
+              <div style={{display:"grid",gap:6}}>
+                {c.scenarios.map((s,i)=>(
+                  <div key={i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"7px 11px",background:C.s2,borderRadius:8,gap:8,flexWrap:"wrap"}}>
+                    <div style={{display:"flex",alignItems:"center",gap:7}}>
+                      <span style={{fontSize:14}}>{s.ico}</span>
+                      <span style={{fontSize:11,color:C.text}}>{s.l}</span>
+                    </div>
+                    <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                      {s.wq!==null&&<span style={{fontSize:11,color:C.muted}}>wq: <b style={{color:s.ok?C.green:C.red}}>{pct(s.wq)}</b></span>}
+                      <Prio level={s.ok?"laag":s.prio}/><Badge ok={s.ok}/>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </Sec>
+          </div>
+        )}
+
+        {/* ════ SCENARIO'S ════════════════════════════════════════════════════════ */}
+        {tab==="scenarios"&&(
+          <div style={{display:"grid",gap:14}}>
+            <ScCard icon="🩺" title="Arbeidsongeschiktheid (WIA/AOV)" accent={C.purple} delay={0}>
+              <Row label="Inkomen P1 bij AO" value={€(c.aoInk1/12)} sub={aov==="ja"?`AOV ${aovPct}%`:"WIA 70%"}/>
+              <Row label="Inkomen P2" value={€(c.inkBruto2/12)}/><Row label="Totaal" value={€(c.aoTotM)} bold/>
+              <WQ value={c.aoWq}/>
+              {(dv1==="zzp"||dv1==="flex")&&<Alert type="bad">ZZP/flex: géén WIA. AOV is essentieel.</Alert>}
+              {c.aoWq>42&&aov==="nee"&&<Alert type="bad">Zonder AOV onvoldoende inkomen. Min. AOV 70% dekking aanbevolen.</Alert>}
+            </ScCard>
+
+            <ScCard icon="💔" title="Overlijden partner 1 + ANW" accent={C.red} delay={20}>
+              <Row label="ORV uitkering P1" value={orv1==="ja"?€(orvB1):"Geen"} accent={orv1==="ja"?C.green:C.red}/>
+              <Row label="ANW-uitkering (indicatief)" value={€(c.anwUitkering)} sub="per maand (indien van toepassing)"/>
+              <Row label="Inkomen P2 + ANW" value={€(c.inkBruto2/12+c.anwUitkering)} bold/>
+              <Row label="Maandlast" value={€(c.mLOrv1)}/>
+              <WQ value={c.ovlWq1MetAnw} label="Woonquote incl. ANW"/>
+              {c.ovlWq1>42&&!orv1&&<Alert type="bad">ORV ontbreekt. Zonder ORV en ANW is de hypotheek niet betaalbaar voor P2.</Alert>}
+            </ScCard>
+
+            <ScCard icon="💙" title="Overlijden partner 2" accent={C.blue} delay={30}>
+              <Row label="ORV P2" value={orv2==="ja"?€(orvB2):"Geen"} accent={orv2==="ja"?C.green:C.red}/>
+              <Row label="Nieuwe last" value={€(c.mLOrv2)} bold/><Row label="P1 solo inkomen" value={€(c.inkBruto1/12)}/>
+              <WQ value={c.ovlWq2}/>
+            </ScCard>
+
+            <ScCard icon="🤒" title="Ziektewet (max. 2 jaar, 70%)" accent={C.yellow} delay={40}>
+              <Row label="ZW-inkomen P1 (70%)" value={€(c.zwInk1)}/><Row label="Inkomen P2" value={€(c.inkBruto2/12)}/>
+              <WQ value={c.zwWq} t={[42,55]}/>
+              <Alert type="info">Na 2 jaar ZW volgt WIA met mogelijk lager inkomen. Tussenperiode is kritiek — zorg voor noodbuffer van min. {€(c.mL*24)}.</Alert>
+            </ScCard>
+
+            <ScCard icon="🤰" title="Zwangerschaps- & bevallingsverlof" accent={C.purple} delay={50}>
+              <Row label="Tijdens verlof (UWV 100%)" value={€(c.inkBruto1/12)} sub="P1 volledig gedekt"/>
+              <Row label="Na terugkeer (schatting 80%)" value={€(c.zdNaInkM)} bold/>
+              <WQ value={c.zdNaWq} label="Woonquote na terugkeer"/>
+              {dv1==="zzp"&&<Alert type="bad">ZZP: geen UWV-zwangerschapsuitkering. AOV met zwangerschapsmodule of eigen buffer vereist.</Alert>}
+            </ScCard>
+
+            <ScCard icon="⏰" title={`Minder werken (−${minderPct}%)`} accent={C.yellow} delay={60}>
+              <Row label="Huidig" value={€(c.inkBrutoM)}/><Row label={`Na −${minderPct}%`} value={€(c.minderInkM)} bold accent={C.yellow}/>
+              <WQ value={c.minderWq}/>
+              <Alert type="info">Max. daling: <b>{pct(Math.max(0,(1-(c.mL/c.inkBrutoM)/0.42)*100))}</b> voor 42% norm.</Alert>
+            </ScCard>
+
+            <ScCard icon="❤️" title="Mantelzorg — partner 2 stopt volledig" accent={C.red} delay={70}>
+              <Row label="P1 solo inkomen" value={€(c.inkBruto1/12)} bold/><Row label="Maandlast" value={€(c.mL)}/>
+              <WQ value={c.mantelWq}/>
+              {c.mantelWq>42&&<Alert type="bad">Grote tweeverdieners-afhankelijkheid. Bij mantelzorg is hypotheek solo niet betaalbaar. Buffer: {€(c.mL*12)}.</Alert>}
+            </ScCard>
+
+            <ScCard icon="👶" title="Kinderkosten & studiekosten" accent={C.teal} delay={80}>
+              <Row label="Netto inkomen" value={€(c.inkNettoM)}/><Row label="Hypotheeklast" value={`−${€(c.mL)}`}/>
+              <Row label="Vaste woonlasten" value={`−${€(c.totWoonlast-c.mL)}`}/><Row label={`Kinderen (${kinderen}×)`} value={`−${€(c.kindMnd)}`} accent={C.red}/>
+              <Row label="Vrij besteedbaar" value={€(c.netCashflow)} accent={c.netCashflow>=300?C.green:C.red} bold/>
+              {kinderen>0&&c.jaarTotStudie>0&&<Row label={`Studiekosten over ~${c.jaarTotStudie}jr`} value={€(c.studieKosten)} sub="per maand"/>}
+              {c.netCashflow<0&&<Alert type="bad">Negatieve cashflow. Tekort {€(Math.abs(c.netCashflow))}/mnd.</Alert>}
+            </ScCard>
+
+            <ScCard icon="🏖️" title={`Pensioen (AOW-leeftijd 67)`} accent={C.green} delay={90}>
+              <Row label="Restschuld bij pensioen" value={c.rsPensioen===0?"Afgelost ✓":€(c.rsPensioen)} accent={c.rsPensioen===0?C.green:C.red} bold/>
+              <Row label="Maandlast op pensioen" value={c.mLPensioen>0?€(c.mLPensioen):"Geen"}/>
+              <Row label="Pensioeninkomen" value={€(c.pensMnd)} sub="per maand"/>
+              {aflVrij>0&&<Row label="Aflossingsvrij nog open" value={€(aflVrij)} accent={C.red} sub="moet herfinanciert worden"/>}
+              <WQ value={c.pensWq} label="Woonquote op pensioen" t={[30,40]}/>
+              {c.rsPensioen===0?<Alert type="ok">Volledig afgelost vóór pensioen.</Alert>:c.pensWq>38?<Alert type="bad">Hoge last op pensioen. Overweeg extra aflossen of verkoop bij pensionering.</Alert>:<Alert type="ok">Pensioeninkomen is voldoende.</Alert>}
+            </ScCard>
+
+            <ScCard icon="💼" title="Werkloosheid (WW)" accent={C.yellow} delay={100}>
+              <Row label="WW-inkomen P1" value={€(c.wwInk1)}/><Row label="Inkomen P2" value={€(c.inkBruto2/12)}/>
+              <Row label="Buffer" value={`${c.bufMnd.toFixed(1)} mnd`} accent={c.bufMnd>=3?C.green:C.red}/>
+              <WQ value={c.wwWq} t={[42,55]}/>
+              {(dv1==="zzp"||dv1==="flex")&&<Alert type="bad">ZZP/flex: geen WW. Min. 6 maanden reserve vereist.</Alert>}
+            </ScCard>
+
+            <ScCard icon="⚖️" title="Scheiding" accent={C.purple} delay={110}>
+              <G cols="1fr 1fr">
+                {[{l:"P1 solo",wq:c.schWq1,ink:c.inkBruto1/12},{l:"P2 solo",wq:c.schWq2,ink:c.inkBruto2/12}].map(p=>(
+                  <div key={p.l} style={{background:C.s2,borderRadius:10,padding:13}}>
+                    <div style={{fontSize:11,fontWeight:600,color:C.sub,marginBottom:8}}>{p.l}</div>
+                    <div style={{fontSize:16,fontWeight:700,color:p.wq<42?C.green:C.red,fontFamily:"'Lora',serif"}}>{pct(p.wq)}</div>
+                    <div style={{fontSize:11,color:C.muted,marginTop:2}}>woonquote</div>
+                    <div style={{marginTop:7}}><Badge ok={p.wq<42||p.ink===0}/></div>
+                  </div>
+                ))}
+              </G>
+              <Row label="Overwaarde bij verkoop" value={€(c.overwaarde)} accent={c.overwaarde>0?C.green:C.red}/>
+            </ScCard>
+          </div>
+        )}
+
+        {/* ════ RENTE & WONING ════════════════════════════════════════════════════ */}
+        {tab==="financieel"&&(
+          <div style={{display:"grid",gap:14}}>
+            <ScCard icon="📈" title={`Nieuwe rentevaste periode → ${nieuweRente}%`} accent={C.blue} delay={0}>
+              <Row label="Restschuld bij herziening" value={€(c.rsNvp)}/><Row label="Huidige last" value={€(c.mL)}/>
+              <Row label="Nieuwe last" value={€(c.mLNvp)} accent={c.nvpDelta>0?C.red:C.green} bold/>
+              <Row label="Verschil p/m" value={`${c.nvpDelta>0?"+":""}${€(c.nvpDelta)}`} accent={c.nvpDelta>0?C.red:C.green}/>
+              <WQ value={c.nvpWq}/>
+              {c.nvpDelta>300&&<Alert type="warn">Bouw {€(c.nvpDelta*24)} buffer op (2 jaar stijging).</Alert>}
+            </ScCard>
+
+            <ScCard icon="🔥" title={`Rente stress test → ${stressRente}%`} accent={C.red} delay={20}>
+              <G cols="repeat(auto-fit,minmax(120px,1fr))">
+                <KPI label="Huidige last" value={€(c.mL)} color={C.gold} small/><KPI label={`Last bij ${stressRente}%`} value={€(c.mLStress)} color={C.red} small/>
+                <KPI label="Extra p/m" value={`+${€(c.stressDelta)}`} color={C.red} small/><KPI label="Extra p/jaar" value={€(c.stressDelta*12)} color={C.red} small/>
+              </G>
+              <WQ value={c.stressWq} label={`Woonquote bij ${stressRente}%`} t={[45,60]}/>
+              {c.stressWq>50?<Alert type="bad">Hypotheek nauwelijks betaalbaar bij extreme rente. Extra aflossen verlaagt dit risico.</Alert>:<Alert type="ok">Betaalbaar bij stress test {stressRente}%.</Alert>}
+            </ScCard>
+
+            <ScCard icon="📊" title="Inflatie & reële last" accent={C.teal} delay={40}>
+              <G cols="repeat(auto-fit,minmax(120px,1fr))">
+                <KPI label="Woonquote nu" value={pct(c.wqBruto)} color={C.gold} small/>
+                <KPI label="Woonquote +10jr" value={pct(c.wqOver10)} color={C.green} small/>
+                <KPI label="Reële schuld +10jr" value={€(c.reeleSchuld10)} sub="in huidig geld" color={C.teal} small/>
+                <KPI label="Inkomen +10jr" value={€(c.inkM10)} sub={`+${loongroei}%/jr`} color={C.blue} small/>
+              </G>
+              <Alert type="ok">Door {loongroei}%/jr loongroei daalt woonquote naar {pct(c.wqOver10)} over 10 jaar. De reële schuld daalt van {€(c.rsTotaal)} naar {€(c.reeleSchuld10)}.</Alert>
+            </ScCard>
+
+            <ScCard icon="📉" title={`Woningwaardedaling −${wwdaling}%`} accent={C.red} delay={60}>
+              <G cols="repeat(auto-fit,minmax(120px,1fr))">
+                <KPI label="Waarde na daling" value={€(c.wwNaDaling)} color={C.red} small/>
+                <KPI label="LTV na daling" value={pct(c.ltvNaDaling)} color={c.ltvNaDaling>100?C.red:c.ltvNaDaling>90?C.yellow:C.green} small/>
+                <KPI label="Onder water bij" value={`−${pct(c.onderwaterBij)}`} color={C.yellow} small/>
+                <KPI label={c.onderWater?"Tekort":"Overwaarde"} value={€(Math.abs(c.wwNaDaling-c.rsTotaal))} color={c.onderWater?C.red:C.green} small/>
+              </G>
+              {c.onderWater&&<><Row label="Restschuld bij gedwongen verkoop" value={€(c.restschuldVerkoop)} accent={C.red} bold/>
+                <Alert type="bad">Onder water! Schuld ({€(c.rsTotaal)}) &gt; waarde ({€(c.wwNaDaling)}). NHG-bescherming: {c.nhgMog?"Ja":"Nee"}.</Alert></>}
+            </ScCard>
+
+            <ScCard icon="🔨" title="Gedwongen verkoop — scenario's" accent={C.orange} delay={80}>
+              {["0","5","10","15","20","25"].map(d=>{
+                const v=ww*(1-Number(d)/100)*0.93,rs=Math.max(0,c.rsTotaal-v);
+                return <div key={d} style={{display:"flex",justifyContent:"space-between",padding:"6px 0",borderBottom:`1px solid ${C.border}`,fontSize:12}}>
+                  <span style={{color:C.sub}}>−{d}% waardedaling</span>
+                  <span style={{color:rs>0?C.red:C.green,fontWeight:600}}>{rs>0?`Restschuld ${€(rs)}`:`Opbrengst +${€(v-c.rsTotaal)}`}</span>
+                </div>;
+              })}
+            </ScCard>
+
+            <ScCard icon="🏗️" title="Dubbele woonlasten & Overbrugging" accent={C.orange} delay={100}>
+              <Row label="Huidige hypotheeklast" value={€(c.mL)}/><Row label="Nieuwe woonlast" value={€(dubbeleLasten)}/>
+              <Row label="Totaal dubbele lasten" value={€(c.totDubbel)} accent={C.orange} bold/>
+              <Row label="Buffer houdt" value={`${c.dubbelMnd} maanden`} accent={Number(c.dubbelMnd)>=3?C.green:C.red}/>
+              {overbrug>0&&<><Row label="Overbruggingsrente p/m" value={€(c.obRente)} sub={`${rente}% over ${€(overbrug)}`}/>
+                <WQ value={c.obWq} label="Woonquote incl. OBK"/></>}
+            </ScCard>
+
+            <ScCard icon="🏢" title="Aflossingsvrij deel" accent={C.red} delay={120}>
+              <G cols="repeat(auto-fit,minmax(120px,1fr))">
+                <KPI label="Aflossingsvrij" value={€(aflVrij)} color={aflVrij>0?C.red:C.green} small/>
+                <KPI label="% van hypotheek" value={pct(c.aflVrijPct)} color={c.aflVrijPct>50?C.red:c.aflVrijPct>0?C.yellow:C.green} small/>
+                <KPI label="LTV aflossingsvrij" value={pct(c.aflVrijLtv)} color={C.yellow} small/>
+                <KPI label="Rente p/m" value={€(c.mLAflVrij)} sub="geen aflossing" color={C.red} small/>
+              </G>
+              {aflVrij>0?<>
+                <Alert type="bad">Aflossingsvrij deel ({€(aflVrij)}) wordt NOOIT afgelost. Op einddatum looptijd moet u dit herfinancieren of aflossen. Houd er rekening mee dat dit bij pensioen moeilijker is.</Alert>
+                {c.aflVrijPct>50&&<Alert type="bad">Meer dan 50% aflossingsvrij — boven de fiscale norm voor renteaftrek.</Alert>}
+              </>:<Alert type="ok">Geen aflossingsvrij deel — volledige hypotheek wordt afgelost.</Alert>}
+            </ScCard>
+
+            <ScCard icon="🌱" title="Energielabel & Klimaatrisico" accent={C.green} delay={140}>
+              <G cols="1fr 1fr">
+                <div style={{background:C.s2,borderRadius:10,padding:14,textAlign:"center"}}>
+                  <div style={{fontSize:11,color:C.muted,marginBottom:5}}>Energielabel</div>
+                  <div style={{fontSize:32,fontWeight:700,fontFamily:"'Lora',serif",color:["A++","A+","A","B"].includes(energieLabel)?C.green:energieLabel==="C"?C.yellow:C.red}}>{energieLabel}</div>
+                  <div style={{fontSize:11,color:C.sub,marginTop:4}}>{c.energieExtra===0?"Gemiddeld":c.energieExtra>0?`+${€(c.energieExtra)}/mnd extra`:€(Math.abs(c.energieExtra))+"/mnd besparing"}</div>
+                </div>
+                <div style={{background:C.s2,borderRadius:10,padding:14,textAlign:"center"}}>
+                  <div style={{fontSize:11,color:C.muted,marginBottom:5}}>Klimaatrisico</div>
+                  <div style={{fontSize:20,fontWeight:700,fontFamily:"'Lora',serif",color:klimaatzone==="geen"?C.green:klimaatzone==="hoog"?C.red:C.yellow}}>{klimaatzone}</div>
+                  <div style={{fontSize:11,color:C.sub,marginTop:4}}>Waardedaling: {€(c.klimaatDaling)}</div>
+                </div>
+              </G>
+              <Row label="LTV na klimaatcorrectie" value={pct(c.ltvNaKlimaat)} accent={c.ltvNaKlimaat<80?C.green:C.yellow}/>
+              {klimaatzone==="hoog"&&<Alert type="bad">Hoog klimaatrisico kan woningwaarde structureel beïnvloeden. Check verzekerbaarheid.</Alert>}
+            </ScCard>
+          </div>
+        )}
+
+        {/* ════ FISCAAL & KOSTEN ═══════════════════════════════════════════════════ */}
+        {tab==="fiscaal"&&(
+          <div style={{display:"grid",gap:14}}>
+            <ScCard icon="💶" title="Hypotheekrenteaftrek (HRA)" accent={C.green} delay={0}>
+              <G cols="repeat(auto-fit,minmax(120px,1fr))">
+                <KPI label="Bruto maandlast" value={€(c.mL)} color={C.gold} small/>
+                <KPI label="Renteaftrek /mnd" value={€(c.aftrekVoordeel)} color={C.green} small/>
+                <KPI label="Netto last (HRA)" value={€(c.nettoML)} color={C.green} small/>
+                <KPI label="Besparing /jaar" value={€(c.aftrekVoordeel*12)} color={C.green} small/>
+              </G>
+              <Row label="Jaarlijkse rente betaald" value={€(c.renteJaar)}/>
+              <Row label="Aftrekbaar (36.97%)" value={€(c.renteJaar*0.3697)} accent={C.green}/>
+              <Row label="Eigenwoningforfait (bijtelling)" value={€(c.ewfBedrag)} accent={C.yellow}/>
+              <Row label="Wet Hillen-correctie" value={€(c.hillenBijtelling)} accent={C.yellow} sub="afbouw 2019–2048"/>
+              <Row label="Netto fiscaal voordeel /jr" value={€(c.fiscaalVoordeel)} accent={c.fiscaalVoordeel>0?C.green:C.red} bold/>
+              <Row label="Netto maandlast (fiscaal)" value={€(c.nettoMlFiscaal)} accent={C.green} bold/>
+              <Alert type="info">EWF daalt naarmate u meer aflost en HRA afneemt. Wet Hillen wordt afgebouwd: elke jaar 3.33% minder voordeel tot 2048.</Alert>
+            </ScCard>
+
+            <ScCard icon="🏛️" title="Eigenwoningforfait (EWF)" accent={C.yellow} delay={20}>
+              <div style={{padding:"9px 13px",background:C.s2,borderRadius:8,fontSize:12,color:C.sub,lineHeight:1.8,marginBottom:13}}>
+                EWF is een fictief inkomen gebaseerd op de WOZ-waarde. U betaalt belasting over dit bedrag, tenzij de renteaftrek hoger is.
+              </div>
+              <Row label="WOZ-waarde" value={€(wozWaarde)}/>
+              <Row label="EWF tarief (0.35%)" value="0.35%" sub="tot €1.31 mln"/>
+              <Row label="EWF bedrag /jr" value={€(c.ewfBedrag)} accent={C.yellow}/>
+              <Row label="EWF bedrag /mnd" value={€(c.ewfMaand)} accent={C.yellow}/>
+              <Row label="Renteaftrek /jr" value={€(c.renteJaar*0.3697)}/>
+              <Row label="Netto (aftrek − EWF)" value={€(c.renteJaar*0.3697-c.ewfBedrag)} accent={c.renteJaar*0.3697>c.ewfBedrag?C.green:C.yellow} bold/>
+            </ScCard>
+
+            <ScCard icon="📦" title="Box 3 Vermogensbelasting" accent={C.orange} delay={40}>
+              <div style={{padding:"9px 13px",background:C.s2,borderRadius:8,fontSize:12,color:C.sub,lineHeight:1.8,marginBottom:13}}>
+                Box 3 belast spaargeld en beleggingen boven de vrijstelling (€57k/persoon, €114k fiscale partners). Effectief tarief ~2.17% over belastbaar vermogen (2025 forfaitair).
+              </div>
+              <Row label="Totaal vermogen" value={€(spaar+beleg)}/>
+              <Row label="Vrijstelling" value={€(ink2>0?114000:57000)} sub={ink2>0?"fiscale partners":"alleenstaand"}/>
+              <Row label="Belastbaar vermogen" value={€(Math.max(0,spaar+beleg-(ink2>0?114000:57000)))}/>
+              <Row label="Box 3 belasting /jr" value={€(c.box3Btg)} accent={C.orange} bold/>
+              <Row label="Box 3 belasting /mnd" value={€(c.box3Mnd)} accent={C.orange}/>
+              {c.box3Btg>0?<Alert type="warn">Box 3 belasting verlaagt uw netto buffer. Houd hier rekening mee in uw cashflow.</Alert>:<Alert type="ok">Vermogen valt onder de vrijstelling — geen box 3 belasting.</Alert>}
+            </ScCard>
+
+            <ScCard icon="🏘️" title="Volledige woonlastenanalyse" accent={C.gold} delay={60}>
+              <G cols="repeat(auto-fit,minmax(115px,1fr))">
+                <KPI label="Hypotheeklast" value={€(c.mL)} color={C.gold} small/>
+                <KPI label="VvE" value={€(vve)} color={vve>0?C.yellow:C.muted} small/>
+                <KPI label="Erfpacht canon" value={€(c.canonMnd)} color={c.canonMnd>0?C.yellow:C.muted} small/>
+                <KPI label="Gemeentelijke lasten" value={€(c.gemeenteMnd)} color={C.yellow} small/>
+                <KPI label="Opstal" value={€(c.opstalMnd)} color={C.yellow} small/>
+                <KPI label="Onderhoud" value={€(c.onderhoud)} color={C.yellow} small/>
+                <KPI label="Energiemeerkosten" value={€(c.energieExtra)} color={c.energieExtra>0?C.red:C.green} small/>
+                <KPI label="Box 3 belasting" value={€(c.box3Mnd)} color={C.orange} small/>
+              </G>
+              <div style={{marginTop:14,padding:"12px 14px",background:C.goldDim,borderRadius:10}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <span style={{fontSize:13,fontWeight:600,color:C.text}}>Totale woonlast p/m</span>
+                  <span style={{fontSize:22,fontWeight:700,color:C.gold,fontFamily:"'Lora',serif"}}>{€(c.totWoonlast+c.onderhoud+c.box3Mnd)}</span>
+                </div>
+                <div style={{marginTop:8,fontSize:12,color:C.sub}}>
+                  Bruto woonquote: <b style={{color:c.totWqBruto<42?C.green:C.red}}>{pct(c.totWqBruto)}</b> · Netto woonquote: <b style={{color:c.totWqNetto<50?C.green:C.red}}>{pct(c.totWqNetto)}</b>
+                </div>
+              </div>
+            </ScCard>
+
+            <ScCard icon="🏙️" title="WOZ & Gemeentelijke lasten" accent={C.teal} delay={80}>
+              <Row label="WOZ-waarde" value={€(wozWaarde)}/>
+              <Row label="OZB (indicatief ~0.15%)" value={€(wozWaarde*0.0015)} sub="per jaar"/>
+              <Row label="Rioolheffing (avg)" value="€300–500" sub="per jaar"/>
+              <Row label="Afvalstoffenheffing (avg)" value="€200–400" sub="per jaar"/>
+              <Row label="Totale gemeentelijke lasten" value={€(gemeenteLasten)} accent={C.yellow} bold/>
+              <Row label="Per maand" value={€(c.gemeenteMnd)}/>
+              <Alert type="info">Gemeentelijke lasten stijgen gemiddeld 3–5% per jaar. Over 10 jaar: {€(gemeenteLasten*Math.pow(1.04,10))} per jaar (bij 4% stijging).</Alert>
+            </ScCard>
+          </div>
+        )}
+
+        {/* ════ STRATEGIE ═════════════════════════════════════════════════════════ */}
+        {tab==="strategie"&&(
+          <div style={{display:"grid",gap:14}}>
+            <ScCard icon="💸" title="Extra aflossen" accent={C.green} delay={0}>
+              <div style={{marginBottom:14}}><Field label="Extra p/m" value={extraAflospm} onChange={setExtraAflospm} pre="€" hint="Boetevrij: ~10–20% van hs/jr"/></div>
+              {extraAflospm>0&&c.extraSim?<>
+                <G cols="repeat(auto-fit,minmax(120px,1fr))">
+                  <KPI label="Looptijd korter" value={`${c.extraKorting.toFixed(1)} jr`} color={C.green} small/>
+                  <KPI label="Rentebesparing" value={€(c.extraBesparing)} color={C.green} small/>
+                  <KPI label="Eerder klaar" value={`${Math.round(c.extraKorting*12)} mnd`} color={C.gold} small/>
+                </G>
+                <Row label="Normale looptijd" value={`${c.rLp} jr`}/>
+                <Row label="Met extra aflossing" value={`${(c.extraSim.maanden/12).toFixed(1)} jr`} accent={C.green} bold/>
+                <Alert type="ok">Extra {€(extraAflospm)}/mnd = {€(c.extraBesparing)} rentebesparing + {c.extraKorting.toFixed(1)} jaar eerder vrij.</Alert>
+              </>:<Alert type="info">Vul een extra maandelijks bedrag in. Max. boetevrij: {€(hs*0.15)}/jr.</Alert>}
+            </ScCard>
+
+            <ScCard icon="⚖️" title="Extra aflossen vs. Beleggen" accent={C.gold} delay={20}>
+              <div style={{padding:"9px 13px",background:C.s2,borderRadius:8,fontSize:12,color:C.sub,lineHeight:1.8,marginBottom:13}}>
+                Wat levert {€(extraAflospm)}/mnd meer op: extra aflossen of beleggen? Rente na aftrek: {pct(c.aflRenteNaAftrek,2)} · Beleggingsrendement na belasting: {pct(c.rendementNaBalsting,2)}
+              </div>
+              <G cols="1fr 1fr">
+                <div style={{background:C.s2,borderRadius:10,padding:14}}>
+                  <div style={{fontSize:11,color:C.sub,marginBottom:6}}>Extra aflossen (10jr)</div>
+                  <div style={{fontSize:18,fontWeight:700,color:C.blue,fontFamily:"'Lora',serif"}}>{€(c.extraBesparing)}</div>
+                  <div style={{fontSize:10,color:C.muted,marginTop:4}}>Rentebesparing totaal</div>
+                </div>
+                <div style={{background:C.s2,borderRadius:10,padding:14}}>
+                  <div style={{fontSize:11,color:C.sub,marginBottom:6}}>Beleggen (10jr, {belegRendement}%)</div>
+                  <div style={{fontSize:18,fontWeight:700,color:C.green,fontFamily:"'Lora',serif"}}>{€(c.extraPm10Belegg)}</div>
+                  <div style={{fontSize:10,color:C.muted,marginTop:4}}>Eindwaarde beleggingen</div>
+                </div>
+              </G>
+              {c.aflVsBelegBeter?<Alert type="ok">Bij {belegRendement}% rendement is <b>beleggen</b> financieel voordeliger dan extra aflossen. Maar aflossen geeft zekerheid en minder risico.</Alert>
+                :<Alert type="warn">Bij {belegRendement}% rendement is <b>extra aflossen</b> financieel voordeliger. Zeker als de rente hoog is.</Alert>}
+              <Alert type="info">Break-even rendement: als uw beleggingsrendement na belasting &gt; {pct(c.aflRenteNaAftrek)} (uw netto rente), dan wint beleggen. Risico speelt altijd een rol.</Alert>
+            </ScCard>
+
+            <ScCard icon="🔄" title="Oversluiten" accent={C.blue} delay={40}>
+              <G><Field label="Nieuwe rente" value={overslNieuweR} onChange={setOverslNieuweR} suf="%" step="0.05"/>
+                <Field label="Boeterente" value={overslBoete} onChange={setOverslBoete} pre="€"/></G>
+              <G cols="repeat(auto-fit,minmax(120px,1fr))" gap={10}>
+                <KPI label="Besparing /mnd" value={€(c.ovslBesp)} color={c.ovslBesp>0?C.green:C.red} small/>
+                <KPI label="Terugverdientijd" value={c.ovslBesp>0?`${c.ovslTerugverdien} mnd`:"n.v.t."} color={c.ovslZinvol?C.green:C.yellow} small/>
+              </G>
+              {c.ovslZinvol?<Alert type="ok">Oversluiten is zinvol — boete terugverdiend in {c.ovslTerugverdien} maanden.</Alert>:overslNieuweR>=rente?<Alert type="info">Nieuwe rente is hoger — oversluiten niet voordelig.</Alert>:<Alert type="warn">Lange terugverdientijd. Wacht op einde rentevaste periode.</Alert>}
+            </ScCard>
+
+            <ScCard icon="📊" title="Annuïteit vs. Lineair" accent={C.gold} delay={60}>
+              <G cols="1fr 1fr">
+                {[{l:"Annuïteit",mL:annML(c.annDeel,rente,lp),totR:c.totRAnn,color:C.blue,pros:["Vaste last","Zekerheid"],cons:["Meer rente"]},
+                  {l:"Lineair",mL:c.annDeel>0?c.annDeel/(lp*12)+c.annDeel*(rente/100/12):0,totR:c.totRLin,color:C.green,pros:["Minder rente","Sneller vrij"],cons:["Hogere start"]}
+                ].map(h=>(
+                  <div key={h.l} style={{background:C.s2,borderRadius:10,padding:14}}>
+                    <div style={{fontSize:13,fontWeight:700,color:h.color,fontFamily:"'Lora',serif",marginBottom:8}}>{h.l}</div>
+                    <div style={{fontSize:10,color:C.muted}}>Start last</div>
+                    <div style={{fontSize:17,fontWeight:700,color:C.text,fontFamily:"'Lora',serif",margin:"3px 0 8px"}}>{€(h.mL)}</div>
+                    <div style={{fontSize:10,color:C.muted}}>Totale rente</div>
+                    <div style={{fontSize:14,fontWeight:700,color:h.color,fontFamily:"'Lora',serif",margin:"3px 0 8px"}}>{€(h.totR)}</div>
+                    <div style={{fontSize:10,color:C.green}}>✓ {h.pros.join(" · ")}</div>
+                    <div style={{fontSize:10,color:C.red}}>✗ {h.cons.join(" · ")}</div>
+                  </div>
+                ))}
+              </G>
+              <Alert type="info">Verschil totale rente: {€(c.totRAnn-c.totRLin)} meer bij annuïteit over {lp} jaar.</Alert>
+            </ScCard>
+
+            <ScCard icon="🔧" title="Verduurzaming ROI" accent={C.teal} delay={80}>
+              <Row label="Investering" value={€(verduurzaming)}/><Row label="Besparing p/m" value={€(c.vdBespMnd)} accent={C.green}/>
+              <Row label="Terugverdientijd" value={`${c.vdTerugverdien.toFixed(1)} jaar`}/>
+              <Row label="ROI per jaar" value={pct(c.vdRoi)} accent={C.green}/>
+              <Alert type="info">Subsidies: ISDE, Warmtefonds (lening 0%), gemeentelijk. Check rvo.nl voor actuele regelingen.</Alert>
+            </ScCard>
+          </div>
+        )}
+
+        {/* ════ BESCHERMING ════════════════════════════════════════════════════════ */}
+        {tab==="bescherming"&&(
+          <div style={{display:"grid",gap:14}}>
+            <ScCard icon="💔" title="ORV — Overlijdensrisicoverzekering" accent={C.red} delay={0}>
+              <G cols="1fr 1fr">
+                {[{l:"Persoon 1",heeft:orv1,setH:setOrv1,bedrag:orvB1,setB:setOrvB1,min:c.rsTotaal*0.7},
+                  {l:"Persoon 2",heeft:orv2,setH:setOrv2,bedrag:orvB2,setB:setOrvB2,min:c.rsTotaal*0.5}
+                ].map(p=>(
+                  <div key={p.l} style={{background:C.s2,borderRadius:10,padding:14}}>
+                    <div style={{fontSize:11,fontWeight:600,color:C.sub,marginBottom:8}}>{p.l}</div>
+                    <Toggle value={p.heeft} onChange={p.setH} opts={[{v:"ja",l:"Ja"},{v:"nee",l:"Nee"}]}/>
+                    {p.heeft==="ja"&&<div style={{marginTop:10}}><Field label="Bedrag" value={p.bedrag} onChange={p.setB} pre="€"/></div>}
+                    <div style={{marginTop:8,fontSize:10,color:C.muted}}>Advies min: <span style={{color:p.heeft==="ja"&&p.bedrag>=p.min?C.green:C.yellow}}>{€(p.min)}</span></div>
+                  </div>
+                ))}
+              </G>
+              {(orv1==="nee"||orv2==="nee")&&<Alert type="bad">Een of beide partners missen een ORV. Groot risico bij overlijden.</Alert>}
+            </ScCard>
+
+            <ScCard icon="🩺" title="AOV — Arbeidsongeschiktheidsverzekering" accent={C.purple} delay={20}>
+              <div style={{marginBottom:14}}>
+                <Toggle value={aov} onChange={setAov} opts={[{v:"ja",l:"Ja"},{v:"nee",l:"Nee"}]}/>
+                {aov==="ja"&&<div style={{marginTop:10}}><Field label="Dekkingspercentage" value={aovPct} onChange={setAovPct} suf="%"/></div>}
+              </div>
+              <G cols="repeat(auto-fit,minmax(120px,1fr))">
+                <KPI label="WIA inkomen P1" value={€(c.inkBruto1*0.70/12)} sub="70%" color={C.yellow} small/>
+                {aov==="ja"&&<KPI label="AOV inkomen P1" value={€(c.inkBruto1*aovPct/100/12)} sub={`${aovPct}%`} color={C.green} small/>}
+                <KPI label="Minimum nodig" value={€(c.mL/0.40)} color={C.red} small/>
+              </G>
+              {(dv1==="zzp"||dv1==="flex")&&<Alert type="bad">ZZP/flex: geen WIA. AOV essentieel (~€120–300/mnd).</Alert>}
+            </ScCard>
+
+            <ScCard icon="🏡" title="Woonlastenverzekering & Buffer" accent={C.yellow} delay={40}>
+              <Toggle value={wlv} onChange={setWlv} opts={[{v:"ja",l:"Ja"},{v:"nee",l:"Nee"}]}/>
+              {wlv==="ja"&&<div style={{marginTop:10}}><Field label="Dekking (maanden)" value={wlvMnd} onChange={setWlvMnd} suf="mnd"/></div>}
+              <div style={{marginTop:14}}>
+                <G cols="repeat(auto-fit,minmax(120px,1fr))">
+                  <KPI label="Buffer" value={€(c.bufTot)} color={C.gold} small/>
+                  <KPI label="Dekking" value={`${c.bufMnd.toFixed(1)} mnd`} color={c.bufMnd>=6?C.green:c.bufMnd>=3?C.yellow:C.red} small/>
+                  <KPI label="Doel 6 mnd" value={€(c.mL*6)} color={C.yellow} small/>
+                </G>
+                <Bar value={c.bufMnd} max={12} t={[3,6]}/>
+              </div>
+              {c.bufMnd<3&&<Alert type="bad">Kritieke buffer. Bouw {€(c.mL*3-c.bufTot)} extra op.</Alert>}
+            </ScCard>
+
+            <ScCard icon="📋" title="Volledig beschermingsoverzicht" accent={C.teal} delay={60}>
+              <div style={{display:"grid",gap:6}}>
+                {[
+                  {l:"ORV persoon 1",ok:orv1==="ja",d:orv1==="ja"?`${€(orvB1)}`:"Ontbreekt"},
+                  {l:"ORV persoon 2",ok:orv2==="ja"||ink2===0,d:orv2==="ja"?`${€(orvB2)}`:ink2===0?"n.v.t.":"Ontbreekt"},
+                  {l:"AOV",ok:aov==="ja"||(dv1!=="zzp"&&dv1!=="flex"),d:aov==="ja"?`${aovPct}%`:dv1==="zzp"?"ZZP: ontbreekt!":"Alleen WIA"},
+                  {l:"Woonlastenverzekering",ok:wlv==="ja",d:wlv==="ja"?`${wlvMnd} mnd`:"Niet afgesloten"},
+                  {l:"Buffer ≥ 3 mnd",ok:c.bufMnd>=3,d:`${c.bufMnd.toFixed(1)} mnd`},
+                  {l:"Buffer ≥ 6 mnd",ok:c.bufMnd>=6,d:`Doel: ${€(c.mL*6)}`},
+                  {l:"NHG",ok:c.nhgMog,d:c.nhgMog?"Ja":"Boven grens"},
+                  {l:"Geen aflossingsvrij",ok:aflVrij===0,d:aflVrij>0?`${€(aflVrij)} open`:"Geen"},
+                  {l:"Woonquote < 40%",ok:c.wqBruto<40,d:pct(c.wqBruto)},
+                  {l:"Stress test < 50%",ok:c.stressWq<50,d:pct(c.stressWq)},
+                  {l:"Niet onder water −20%",ok:c.rsTotaal<ww*0.80,d:c.onderWater?"Risico!":"Veilig"},
+                  {l:"Energielabel ≥ C",ok:["A++","A+","A","B","C"].includes(energieLabel),d:`Label ${energieLabel}`},
+                ].map((item,i)=>(
+                  <div key={i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"7px 11px",background:C.s2,borderRadius:8,gap:8,flexWrap:"wrap"}}>
+                    <div style={{display:"flex",alignItems:"center",gap:7}}><span style={{fontSize:13}}>{item.ok?"✅":"❌"}</span><span style={{fontSize:11,color:C.text}}>{item.l}</span></div>
+                    <span style={{fontSize:11,color:item.ok?C.sub:C.red}}>{item.d}</span>
+                  </div>
+                ))}
+              </div>
+              <div style={{marginTop:12,padding:"10px 13px",background:C.goldDim,borderRadius:9,fontSize:12,color:C.gold,fontWeight:600}}>
+                Score: {[orv1==="ja",orv2==="ja"||ink2===0,aov==="ja"||(dv1!=="zzp"&&dv1!=="flex"),wlv==="ja",c.bufMnd>=3,c.nhgMog,aflVrij===0].filter(Boolean).length}/7 kernpunten op orde
+              </div>
+            </ScCard>
+          </div>
+        )}
+
+        {/* ════ EXTERNE BRONNEN ════════════════════════════════════════════════ */}
+        {tab==="extern"&&(()=>{
+          const klimGem = (klimWater+klimOverstr+klimDroogte+klimHitte)/4;
+          const klimOk = klimGem<5;
+          const fundLabels={A:1,B:2,C:3,D:4,E:5};
+          const fundOk = fundLabel==="A"||fundLabel==="B";
+          const fundKosten={A:0,B:5000,C:20000,D:65000,E:120000};
+          const fundHerstel = fundKosten[fundLabel]||0;
+          const wonGem = (wonScore+wonLeef+wonVoorz)/3;
+          const wonOk = wonGem>=6;
+          const renteDelta = rente-marktRente;
+          const renteOk = renteDelta<=0.3;
+          const jaarBesp = renteDelta>0 ? c.rsTotaal*(renteDelta/100) : 0;
+
+          async function opzoeken(){
+            setExtLoading(true); setExtStatus("Zoeken..."); setExtAiData(null);
+            try {
+              const res = await fetch("https://api.anthropic.com/v1/messages",{
+                method:"POST", headers:{"Content-Type":"application/json"},
+                body:JSON.stringify({
+                  model:"claude-sonnet-4-20250514", max_tokens:800,
+                  tools:[{type:"web_search_20250305",name:"web_search"}],
+                  messages:[{role:"user",content:`Zoek voor adres ${extPostcode} ${extHuisnr} Nederland: klimaatcijfer scores (wateroverlast/overstroming/droogte/hitte 1-10), funderingslabel (A-E), woningcijfer (1-10), actuele hypotheekrente 10jr vast. Geef ALLEEN JSON: {"klimaat":{"wateroverlast":N,"overstroming":N,"droogte":N,"hitte":N},"fundering":{"label":"X","type":"hout/beton/onbekend"},"woning":{"score":N,"leefbaarheid":N,"voorzieningen":N},"hypotheek":{"marktrente":N}}`}]
+                })
+              });
+              const d = await res.json();
+              const txt = (d.content||[]).filter(b=>b.type==="text").map(b=>b.text).join(" ");
+              const m = txt.match(/\{[\s\S]*\}/);
+              if(m){ const p=JSON.parse(m[0]);
+                if(p.klimaat){setKlimWater(p.klimaat.wateroverlast||3);setKlimOverstr(p.klimaat.overstroming||2);setKlimDroogte(p.klimaat.droogte||4);setKlimHitte(p.klimaat.hitte||4);}
+                if(p.fundering){setFundLabel(p.fundering.label||"C");setFundType(p.fundering.type||"beton");}
+                if(p.woning){setWonScore(p.woning.score||7);setWonLeef(p.woning.leefbaarheid||7);setWonVoorz(p.woning.voorzieningen||6);}
+                if(p.hypotheek){setMarktRente(p.hypotheek.marktrente||3.9);}
+                setExtStatus("✅ Scores ingevuld — controleer en pas aan indien nodig");
+                setExtAiData(p);
+              } else { setExtStatus("⚠️ Geen exacte data gevonden — vul handmatig in via de sites hieronder"); }
+            } catch(e){ setExtStatus("❌ Fout bij ophalen — vul handmatig in"); } finally { setExtLoading(false); }
+          }
+
+          const SliderRow = ({label,value,onChange}) => {
+            const color=value>7?C.red:value>4?C.yellow:C.green;
+            return <div style={{marginBottom:12}}>
+              <div style={{display:"flex",justifyContent:"space-between",fontSize:12,marginBottom:4}}>
+                <span style={{color:C.sub}}>{label}</span>
+                <span style={{fontWeight:700,color,fontFamily:"'Lora',serif"}}>{value}/10</span>
+              </div>
+              <input type="range" min={1} max={10} value={value} onChange={e=>onChange(Number(e.target.value))}
+                style={{width:"100%",accentColor:color}}/>
+              <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:C.muted,marginTop:2}}><span>1 = laag</span><span>10 = hoog risico</span></div>
+            </div>;
+          };
+
+          return <div style={{display:"grid",gap:14}}>
+            {/* Adres & lookup */}
+            <Sec title="📍 Adres opzoeken" delay={0}>
+              <p style={{fontSize:12,color:C.muted,marginBottom:14,lineHeight:1.7}}>Vul uw adres in en klik "AI Opzoeken" — de AI zoekt scores op via klimaatcijfer.nl, funderingscijfer.nl, woningcijfer.nl en hypotheekcijfer.nl. Daarna kunt u de scores handmatig aanpassen.</p>
+              <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:12}}>
+                {[["Postcode",extPostcode,setExtPostcode,100,"1234AB"],["Huisnr.",extHuisnr,setExtHuisnr,80,"1"]].map(([lbl,val,set,w,ph])=>(
+                  <div key={lbl} style={{display:"flex",flexDirection:"column",gap:4}}>
+                    <label style={{fontSize:10,fontWeight:600,color:C.muted,letterSpacing:1.1,textTransform:"uppercase"}}>{lbl}</label>
+                    <input value={val} onChange={e=>set(e.target.value.toUpperCase())} placeholder={ph}
+                      style={{width:w,background:C.s2,border:`1px solid ${C.border}`,borderRadius:8,color:C.text,padding:"9px 10px",fontSize:14,fontFamily:"inherit",outline:"none"}}/>
+                  </div>
+                ))}
+                <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                  <label style={{fontSize:10,fontWeight:600,color:C.muted,letterSpacing:1.1,textTransform:"uppercase"}}>&nbsp;</label>
+                  <button onClick={opzoeken} disabled={extLoading} style={{background:extLoading?C.s3:`linear-gradient(135deg,${C.gold},#8b6914)`,color:extLoading?C.muted:"#07090f",border:"none",borderRadius:8,padding:"9px 18px",fontSize:13,fontWeight:700,cursor:extLoading?"wait":"pointer",fontFamily:"inherit"}}>
+                    {extLoading?"⏳ Zoeken...":"🔍 AI Opzoeken"}
+                  </button>
+                </div>
+              </div>
+              {extStatus&&<div style={{fontSize:12,padding:"8px 12px",borderRadius:8,background:C.s2,color:extStatus.startsWith("✅")?C.green:extStatus.startsWith("❌")?C.red:C.yellow,marginBottom:12}}>{extStatus}</div>}
+              <div style={{display:"flex",gap:7,flexWrap:"wrap"}}>
+                <span style={{fontSize:11,color:C.muted,alignSelf:"center"}}>Direct openen:</span>
+                {[["🌊 klimaatcijfer.nl","https://www.klimaatcijfer.nl",C.blue],["🏗️ funderingscijfer.nl","https://www.funderingscijfer.nl",C.orange],["🏠 woningcijfer.nl","https://www.woningcijfer.nl",C.teal],["📊 hypotheekcijfer.nl","https://www.hypotheekcijfer.nl",C.gold]].map(([l,u,col])=>(
+                  <a key={l} href={u} target="_blank" rel="noopener noreferrer" style={{background:`${col}18`,color:col,border:`1px solid ${col}35`,borderRadius:7,padding:"5px 11px",fontSize:11,fontWeight:600,textDecoration:"none"}}>
+                    {l} ↗
+                  </a>
+                ))}
+              </div>
+            </Sec>
+
+            {/* Samenvatting */}
+            {[!klimOk,!fundOk,!wonOk,!renteOk].some(Boolean)&&(
+              <div style={{background:C.redDim,border:`1px solid ${C.red}30`,borderRadius:11,padding:"13px 16px",display:"flex",gap:12,alignItems:"center"}}>
+                <span style={{fontSize:22}}>⚠️</span>
+                <div>
+                  <div style={{fontSize:13,fontWeight:700,color:C.red,marginBottom:3}}>{[!klimOk&&"Klimaat",!fundOk&&"Fundering",!wonOk&&"Woningcijfer",!renteOk&&"Rente"].filter(Boolean).length} externe risico's</div>
+                  <div style={{fontSize:12,color:C.red}}>{[!klimOk&&"Klimaatrisico",!fundOk&&"Funderingsrisico",!wonOk&&"Woningkwaliteit",!renteOk&&"Renteachterstand"].filter(Boolean).join(" · ")}</div>
+                </div>
+              </div>
+            )}
+
+            {/* Klimaatcijfer */}
+            <div className="card" style={{background:C.surface,borderRadius:13,border:`1px solid ${C.border}`,overflow:"hidden"}}>
+              <div style={{background:`${C.blue}12`,borderBottom:`1px solid ${C.border}`,padding:"13px 18px",display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,flexWrap:"wrap"}}>
+                <div style={{display:"flex",alignItems:"center",gap:9}}><span style={{fontSize:19}}>🌊</span><div><div style={{fontSize:14,fontWeight:600,color:C.text,fontFamily:"'Lora',serif"}}>Klimaatcijfer.nl</div><div style={{fontSize:10,color:C.muted}}>klimaatcijfer.nl</div></div></div>
+                <div style={{display:"flex",gap:8,alignItems:"center"}}><span style={{fontSize:17,fontWeight:700,fontFamily:"'Lora',serif",color:klimGem>6?C.red:klimGem>4?C.yellow:C.green}}>{klimGem.toFixed(1)}/10</span><Badge ok={klimOk}/><a href="https://www.klimaatcijfer.nl" target="_blank" rel="noopener noreferrer" style={{background:`${C.blue}22`,color:C.blue,border:`1px solid ${C.blue}40`,borderRadius:7,padding:"4px 11px",fontSize:11,fontWeight:600,textDecoration:"none"}}>↗ Open</a></div>
+              </div>
+              <div style={{padding:18}}>
+                <SliderRow label="💧 Wateroverlast" value={klimWater} onChange={setKlimWater}/>
+                <SliderRow label="🌊 Overstroming" value={klimOverstr} onChange={setKlimOverstr}/>
+                <SliderRow label="🌵 Droogte" value={klimDroogte} onChange={setKlimDroogte}/>
+                <SliderRow label="🔥 Hitte" value={klimHitte} onChange={setKlimHitte}/>
+                <G cols="1fr 1fr" gap={10}>
+                  {[{l:"Gem. klimaatcijfer",v:`${klimGem.toFixed(1)}/10`,c:klimGem>6?C.red:klimGem>4?C.yellow:C.green},{l:"Verzekering",v:klimGem>7?"Mogelijk onverzekerbaar":klimGem>5?"+€200–500/jr":"Normaal",c:klimGem>7?C.red:klimGem>5?C.yellow:C.green},{l:"Waarde-effect",v:klimOverstr>7?"−5 tot −15%":klimWater>7?"−2 tot −8%":"Beperkt",c:klimOverstr>7?C.red:C.yellow},{l:"Aanpassing",v:klimGem>6?"€5k–€30k":"Beperkt",c:klimGem>6?C.yellow:C.green}].map(k=>(
+                    <div key={k.l} style={{background:C.s2,borderRadius:8,padding:10}}><div style={{fontSize:10,color:C.muted,marginBottom:3}}>{k.l}</div><div style={{fontSize:13,fontWeight:700,color:k.c,fontFamily:"'Lora',serif"}}>{k.v}</div></div>
+                  ))}
+                </G>
+                {klimOverstr>7&&<Alert type="bad">Zeer hoog overstromingsrisico. Controleer verzekerbaarheid en WOZ-waarde ontwikkeling.</Alert>}
+                {klimOk&&<Alert type="ok">Klimaatscores zijn acceptabel voor dit adres.</Alert>}
+              </div>
+            </div>
+
+            {/* Funderingscijfer */}
+            <div className="card" style={{background:C.surface,borderRadius:13,border:`1px solid ${C.border}`,overflow:"hidden"}}>
+              <div style={{background:`${C.orange}12`,borderBottom:`1px solid ${C.border}`,padding:"13px 18px",display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,flexWrap:"wrap"}}>
+                <div style={{display:"flex",alignItems:"center",gap:9}}><span style={{fontSize:19}}>🏗️</span><div><div style={{fontSize:14,fontWeight:600,color:C.text,fontFamily:"'Lora',serif"}}>Funderingscijfer.nl</div><div style={{fontSize:10,color:C.muted}}>funderingscijfer.nl — FunderMaps A–E systematiek</div></div></div>
+                <div style={{display:"flex",gap:8,alignItems:"center"}}><span style={{fontSize:17,fontWeight:700,fontFamily:"'Lora',serif",color:{A:C.green,B:C.teal,C:C.yellow,D:C.orange,E:C.red}[fundLabel]||C.sub}}>Label {fundLabel}</span><Badge ok={fundOk}/><a href="https://www.funderingscijfer.nl" target="_blank" rel="noopener noreferrer" style={{background:`${C.orange}22`,color:C.orange,border:`1px solid ${C.orange}40`,borderRadius:7,padding:"4px 11px",fontSize:11,fontWeight:600,textDecoration:"none"}}>↗ Open</a></div>
+              </div>
+              <div style={{padding:18}}>
+                <div style={{marginBottom:14}}>
+                  <div style={{fontSize:10,fontWeight:600,color:C.muted,letterSpacing:1.1,textTransform:"uppercase",marginBottom:7}}>Funderingslabel</div>
+                  <div style={{display:"flex",gap:6}}>
+                    {[["A",C.green,"Uitstekend"],["B",C.teal,"Goed"],["C",C.yellow,"Matig"],["D",C.orange,"Slecht"],["E",C.red,"Kritiek"]].map(([v,col,hint])=>(
+                      <button key={v} onClick={()=>setFundLabel(v)} style={{padding:"7px 14px",borderRadius:7,border:`1px solid ${fundLabel===v?col:C.border}`,background:fundLabel===v?`${col}22`:"transparent",color:fundLabel===v?col:C.sub,cursor:"pointer",fontSize:12,fontWeight:700,fontFamily:"inherit",flex:1,transition:"all .2s"}} title={hint}>{v}</button>
+                    ))}
+                  </div>
+                  {[["A","Uitstekend — geen risico"],["B","Goed — beperkt risico"],["C","Matig — periodiek monitoren"],["D","Slecht — onderzoek nodig (QuickScan €350–650)"],["E","Kritiek — direct herstel vereist (€80k–€150k)"]].find(([v])=>v===fundLabel)&&(
+                    <div style={{fontSize:11,color:C.sub,marginTop:6}}>ℹ️ {[["A","Uitstekend — geen risico"],["B","Goed — beperkt risico"],["C","Matig — periodiek monitoren"],["D","Slecht — onderzoek nodig (QuickScan €350–650)"],["E","Kritiek — direct herstel vereist (€80k–€150k)"]].find(([v])=>v===fundLabel)[1]}</div>
+                  )}
+                </div>
+                <div style={{display:"flex",gap:6,marginBottom:14,flexWrap:"wrap"}}>
+                  {[["beton","Beton",C.green],["hout","Hout (paalrot!)",C.yellow],["staal","Staal",C.teal],["ondiep","Ondiep",C.orange],["onbekend","Onbekend",C.sub]].map(([v,l,col])=>(
+                    <button key={v} onClick={()=>setFundType(v)} style={{padding:"5px 11px",borderRadius:7,border:`1px solid ${fundType===v?col:C.border}`,background:fundType===v?`${col}22`:"transparent",color:fundType===v?col:C.sub,cursor:"pointer",fontSize:11,fontWeight:600,fontFamily:"inherit"}}>{l}</button>
+                  ))}
+                </div>
+                <div style={{marginBottom:14}}>
+                  <Field label="Bouwjaar woning" value={fundBouwjaar} onChange={setFundBouwjaar}/>
+                </div>
+                <G cols="1fr 1fr" gap={10}>
+                  {[{l:"Herstelkosten",v:fundHerstel>0?`€${fundHerstel.toLocaleString("nl-NL")}`:"Geen",c:fundHerstel>50000?C.red:fundHerstel>0?C.yellow:C.green},{l:"Waarde-effect",v:{A:"Neutraal",B:"Neutraal",C:"−0 tot −5%",D:"−5 tot −15%",E:"−10 tot −25%"}[fundLabel],c:{A:C.green,B:C.green,C:C.yellow,D:C.red,E:C.red}[fundLabel]},{l:"Paalrot risico",v:fundType==="hout"&&fundBouwjaar<1970?"Hoog":fundType==="hout"?"Matig":"Laag",c:fundType==="hout"&&fundBouwjaar<1970?C.red:fundType==="hout"?C.yellow:C.green},{l:"Financiering",v:{A:"Normaal",B:"Normaal",C:"Normaal",D:"Moeizamer",E:"Mogelijk geen hyp."}[fundLabel],c:{A:C.green,B:C.green,C:C.green,D:C.yellow,E:C.red}[fundLabel]}].map(k=>(
+                    <div key={k.l} style={{background:C.s2,borderRadius:8,padding:10}}><div style={{fontSize:10,color:C.muted,marginBottom:3}}>{k.l}</div><div style={{fontSize:13,fontWeight:700,color:k.c,fontFamily:"'Lora',serif"}}>{k.v}</div></div>
+                  ))}
+                </G>
+                {fundLabel==="E"&&<Alert type="bad">Kritieke fundering! Herstel urgent — €80k–€150k. Hypotheekverstrekker kan aanvullende eisen stellen. Direct een funderingsonderzoek (QuickScan ~€350–650).</Alert>}
+                {fundLabel==="D"&&<Alert type="bad">Slechte fundering (D). Funderingsonderzoek sterk aanbevolen. Kosten: €40k–€80k.</Alert>}
+                {fundType==="hout"&&fundBouwjaar<1970&&<Alert type="warn">Houten palen + bouwjaar vóór 1970: verhoogd paalrot-risico. Meest voorkomende funderingsprobleem NL (487k+ woningen).</Alert>}
+                {fundOk&&!( fundType==="hout"&&fundBouwjaar<1970)&&<Alert type="ok">Funderingslabel {fundLabel} — geen direct risico.</Alert>}
+              </div>
+            </div>
+
+            {/* Woningcijfer */}
+            <div className="card" style={{background:C.surface,borderRadius:13,border:`1px solid ${C.border}`,overflow:"hidden"}}>
+              <div style={{background:`${C.teal}12`,borderBottom:`1px solid ${C.border}`,padding:"13px 18px",display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,flexWrap:"wrap"}}>
+                <div style={{display:"flex",alignItems:"center",gap:9}}><span style={{fontSize:19}}>🏠</span><div><div style={{fontSize:14,fontWeight:600,color:C.text,fontFamily:"'Lora',serif"}}>Woningcijfer.nl</div><div style={{fontSize:10,color:C.muted}}>woningcijfer.nl</div></div></div>
+                <div style={{display:"flex",gap:8,alignItems:"center"}}><span style={{fontSize:17,fontWeight:700,fontFamily:"'Lora',serif",color:wonGem>=7?C.green:wonGem>=5?C.yellow:C.red}}>{wonGem.toFixed(1)}/10</span><Badge ok={wonOk}/><a href="https://www.woningcijfer.nl" target="_blank" rel="noopener noreferrer" style={{background:`${C.teal}22`,color:C.teal,border:`1px solid ${C.teal}40`,borderRadius:7,padding:"4px 11px",fontSize:11,fontWeight:600,textDecoration:"none"}}>↗ Open</a></div>
+              </div>
+              <div style={{padding:18}}>
+                <SliderRow label="🏠 Woningkwaliteit" value={wonScore} onChange={setWonScore}/>
+                <SliderRow label="🌳 Leefbaarheid buurt" value={wonLeef} onChange={setWonLeef}/>
+                <SliderRow label="🛒 Voorzieningen" value={wonVoorz} onChange={setWonVoorz}/>
+                <G cols="1fr 1fr" gap={10}>
+                  {[{l:"Gem. woningcijfer",v:`${wonGem.toFixed(1)}/10`,c:wonGem>=7?C.green:wonGem>=5?C.yellow:C.red},{l:"Waarde-effect",v:wonScore<5?"−5 tot −10%":wonScore<7?"−0 tot −3%":"Neutraal+",c:wonScore<5?C.red:wonScore<7?C.yellow:C.green},{l:"Verkoopbaarheid",v:wonGem>=7?"Goed":wonGem>=5?"Matig":"Moeizaam",c:wonGem>=7?C.green:wonGem>=5?C.yellow:C.red},{l:"Buurttrend",v:wonLeef>=7?"Positief":wonLeef>=5?"Stabiel":"Dalend",c:wonLeef>=7?C.green:wonLeef>=5?C.yellow:C.red}].map(k=>(
+                    <div key={k.l} style={{background:C.s2,borderRadius:8,padding:10}}><div style={{fontSize:10,color:C.muted,marginBottom:3}}>{k.l}</div><div style={{fontSize:13,fontWeight:700,color:k.c,fontFamily:"'Lora',serif"}}>{k.v}</div></div>
+                  ))}
+                </G>
+                {wonGem<5&&<Alert type="bad">Lage woningcijfer-score. Verhoogd risico op waardedaling. Houd extra buffer aan.</Alert>}
+                {wonOk&&<Alert type="ok">Woningcijfer-scores zijn voldoende — positieve woonomgeving.</Alert>}
+              </div>
+            </div>
+
+            {/* Hypotheekcijfer */}
+            <div className="card" style={{background:C.surface,borderRadius:13,border:`1px solid ${C.border}`,overflow:"hidden"}}>
+              <div style={{background:`${C.gold}12`,borderBottom:`1px solid ${C.border}`,padding:"13px 18px",display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,flexWrap:"wrap"}}>
+                <div style={{display:"flex",alignItems:"center",gap:9}}><span style={{fontSize:19}}>📊</span><div><div style={{fontSize:14,fontWeight:600,color:C.text,fontFamily:"'Lora',serif"}}>Hypotheekcijfer.nl</div><div style={{fontSize:10,color:C.muted}}>hypotheekcijfer.nl — rente vergelijking</div></div></div>
+                <div style={{display:"flex",gap:8,alignItems:"center"}}><span style={{fontSize:17,fontWeight:700,fontFamily:"'Lora',serif",color:renteOk?C.green:C.red}}>Δ{renteDelta>0?"+":""}{renteDelta.toFixed(2)}%</span><Badge ok={renteOk}/><a href="https://www.hypotheekcijfer.nl" target="_blank" rel="noopener noreferrer" style={{background:`${C.gold}22`,color:C.gold,border:`1px solid ${C.gold}40`,borderRadius:7,padding:"4px 11px",fontSize:11,fontWeight:600,textDecoration:"none"}}>↗ Open</a></div>
+              </div>
+              <div style={{padding:18}}>
+                <div style={{marginBottom:14}}>
+                  <Field label="Laagste marktrente 10jr vast (van hypotheekcijfer.nl)" value={marktRente} onChange={setMarktRente} suf="%" step="0.05"/>
+                </div>
+                <G cols="repeat(auto-fit,minmax(120px,1fr))" gap={10}>
+                  <KPI label="Uw rente" value={`${rente.toFixed(2)}%`} color={C.gold} small/>
+                  <KPI label="Markt laagste" value={`${marktRente.toFixed(2)}%`} color={marktRente<rente?C.green:C.red} small/>
+                  <KPI label="Verschil" value={`${renteDelta>0?"+":""}${renteDelta.toFixed(2)}%`} color={renteDelta>0.3?C.red:renteDelta>0?C.yellow:C.green} small/>
+                  <KPI label="Besparing /jr" value={jaarBesp>0?`€${Math.round(jaarBesp).toLocaleString("nl-NL")}`:"Al optimaal"} color={jaarBesp>1500?C.green:C.sub} small/>
+                </G>
+                {jaarBesp>0&&<div style={{marginTop:12,padding:"10px 13px",background:`${C.green}15`,borderRadius:9,fontSize:12,color:C.green}}>💡 Oversluiten of onderhandelen levert <b>€{Math.round(jaarBesp*10).toLocaleString("nl-NL")}</b> op over 10 jaar.</div>}
+                {renteDelta>0.8&&<Alert type="bad">Rente meer dan 0,8% boven markt. Contact opnemen met uw bank of oversluiten overwegen.</Alert>}
+                {renteDelta>0.3&&renteDelta<=0.8&&<Alert type="warn">Rente boven markt. Bij renteverlenging scherp onderhandelen.</Alert>}
+                {renteOk&&<Alert type="ok">Uw rente is concurrerend ten opzichte van de actuele markt.</Alert>}
+              </div>
+            </div>
+
+            {/* Gecombineerd overzicht */}
+            <Sec title="📋 Gecombineerd extern risicooverzicht" delay={0}>
+              <div style={{display:"grid",gap:7,marginBottom:14}}>
+                {[
+                  {ico:"🌊",l:"Klimaatcijfer",score:`${klimGem.toFixed(1)}/10`,ok:klimOk,detail:`Water:${klimWater} · Overstr:${klimOverstr} · Droogte:${klimDroogte} · Hitte:${klimHitte}`},
+                  {ico:"🏗️",l:"Funderingscijfer",score:`Label ${fundLabel}`,ok:fundOk,detail:fundHerstel>0?`Schatting herstelkosten: €${fundHerstel.toLocaleString("nl-NL")}`:"Geen directe kosten"},
+                  {ico:"🏠",l:"Woningcijfer",score:`${wonGem.toFixed(1)}/10`,ok:wonOk,detail:`Woning:${wonScore} · Leef:${wonLeef} · Voorz:${wonVoorz}`},
+                  {ico:"📊",l:"Hypotheekcijfer",score:`Δ${renteDelta>0?"+":""}${renteDelta.toFixed(2)}%`,ok:renteOk,detail:jaarBesp>0?`Besparing mogelijk: €${Math.round(jaarBesp).toLocaleString("nl-NL")}/jr`:"Rente is concurrerend"},
+                ].map((s,i)=>(
+                  <div key={i} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"9px 12px",background:C.s2,borderRadius:9,gap:8,flexWrap:"wrap"}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8}}><span style={{fontSize:16}}>{s.ico}</span><div><div style={{fontSize:12,fontWeight:600,color:C.text}}>{s.l}</div><div style={{fontSize:10,color:C.muted,marginTop:1}}>{s.detail}</div></div></div>
+                    <div style={{display:"flex",gap:8,alignItems:"center"}}><span style={{fontSize:13,fontWeight:700,fontFamily:"'Lora',serif",color:s.ok?C.green:C.red}}>{s.score}</span><Badge ok={s.ok}/></div>
+                  </div>
+                ))}
+              </div>
+              <G cols="repeat(auto-fit,minmax(130px,1fr))" gap={10}>
+                {[
+                  {l:"Funderingsherstel",v:fundHerstel>0?`€${fundHerstel.toLocaleString("nl-NL")}`:"€0",c:fundHerstel>50000?C.red:fundHerstel>0?C.yellow:C.green},
+                  {l:"Klimaat verzekering",v:klimGem>7?"Mogelijk onverzekerbaar":klimGem>5?"+€200–500/jr":"Normaal",c:klimGem>7?C.red:klimGem>5?C.yellow:C.green},
+                  {l:"Waardecorrectie",v:`−€${Math.round((klimGem>5?ww*0.03:0)+(fundHerstel*0.3)+(wonScore<6?ww*0.04:0)).toLocaleString("nl-NL")}`,c:C.red},
+                  {l:"Rentebesparing",v:jaarBesp>0?`€${Math.round(jaarBesp).toLocaleString("nl-NL")}/jr`:"n.v.t.",c:jaarBesp>0?C.green:C.sub},
+                ].map(k=>(
+                  <div key={k.l} style={{background:C.s2,borderRadius:9,padding:12,textAlign:"center"}}>
+                    <div style={{fontSize:14,fontWeight:700,color:k.c,fontFamily:"'Lora',serif"}}>{k.v}</div>
+                    <div style={{fontSize:10,color:C.muted,marginTop:4}}>{k.l}</div>
+                  </div>
+                ))}
+              </G>
+            </Sec>
+          </div>;
+        })()}
+
+        {/* ════ ACTIEPUNTEN ════════════════════════════════════════════════════════ */}
+        {tab==="actiepunten"&&(
+          <div style={{display:"grid",gap:14}}>
+
+            {/* Prioriteitenmatrix */}
+            <Sec title="🎯 Prioriteitenmatrix — wat moet u nú doen?" delay={0}>
+              {[
+                {prio:"kritiek",items:c.scenarios.filter(s=>!s.ok&&s.prio==="kritiek"),color:C.red,desc:"Direct actie vereist — groot financieel risico"},
+                {prio:"hoog",items:c.scenarios.filter(s=>!s.ok&&s.prio==="hoog"),color:C.orange,desc:"Aanpakken binnen 3 maanden"},
+                {prio:"middel",items:c.scenarios.filter(s=>!s.ok&&s.prio==="middel"),color:C.yellow,desc:"Plan voor de komende 6–12 maanden"},
+                {prio:"laag",items:c.scenarios.filter(s=>!s.ok&&s.prio==="laag"),color:C.sub,desc:"Op termijn verbeteren"},
+              ].filter(g=>g.items.length>0).map(g=>(
+                <div key={g.prio} style={{marginBottom:16}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+                    <Prio level={g.prio}/><span style={{fontSize:12,color:C.sub}}>{g.desc}</span>
+                  </div>
+                  <div style={{display:"grid",gap:6}}>
+                    {g.items.map((s,i)=>(
+                      <div key={i} style={{display:"flex",alignItems:"center",gap:9,padding:"10px 13px",background:C.s2,borderRadius:9,border:`1px solid ${g.color}22`}}>
+                        <span style={{fontSize:16}}>{s.ico}</span>
+                        <div style={{flex:1}}>
+                          <div style={{fontSize:12,fontWeight:600,color:C.text}}>{s.l}</div>
+                          <div style={{fontSize:10,color:C.muted,marginTop:2}}>{s.wq!==null?`Woonquote: ${pct(s.wq)} — `:""}Actie vereist</div>
+                        </div>
+                        <Badge ok={false}/>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+              {c.risicoCount===0&&<Alert type="ok">Uitstekend! Alle scenario's zijn in orde. Voer jaarlijks een hercheck uit.</Alert>}
+            </Sec>
+
+            {/* Concrete acties */}
+            <Sec title="✅ Concrete actie-checklist" delay={50}>
+              {[
+                {check:orv1==="nee"&&ink2>0,l:"Sluit een ORV af voor partner 1",detail:`Min. ${€(c.rsTotaal*0.7)} — kost ca. €10–30/mnd`,prio:"kritiek"},
+                {check:orv2==="nee"&&ink2>0,l:"Sluit een ORV af voor partner 2",detail:`Min. ${€(c.rsTotaal*0.5)} — kost ca. €8–25/mnd`,prio:"hoog"},
+                {check:aov==="nee"&&(dv1==="zzp"||dv1==="flex"),l:"Sluit een AOV af (ZZP/flex — urgent!)",detail:"Geen WIA-recht. AOV ~€120–300/mnd",prio:"kritiek"},
+                {check:aov==="nee"&&dv1==="vast",l:"Overweeg een AOV aanvullend op WIA",detail:"WIA dekt maar 70% — AOV vult aan",prio:"hoog"},
+                {check:c.bufMnd<3,l:"Bouw noodbuffer op tot minimaal 3 maanden",detail:`Nog ${€(Math.max(0,c.mL*3-c.bufTot))} sparen`,prio:"kritiek"},
+                {check:c.bufMnd>=3&&c.bufMnd<6,l:"Vergroot buffer naar 6 maanden woonlasten",detail:`Nog ${€(Math.max(0,c.mL*6-c.bufTot))} sparen`,prio:"middel"},
+                {check:c.aflVrijRisico,l:"Maak plan voor aflossingsvrij deel",detail:`${€(aflVrij)} moet bij einde looptijd afgelost`,prio:"hoog"},
+                {check:c.pensWq>38&&c.rsPensioen>0,l:"Start met extra aflossen voor pensioen",detail:`Restschuld op pensioen: ${€(c.rsPensioen)}`,prio:"hoog"},
+                {check:c.nvpDelta>300,l:"Bouw renteherziening-buffer op",detail:`Last stijgt ${€(c.nvpDelta)}/mnd over ${Math.max(0,rvp-betaald)} jaar`,prio:"middel"},
+                {check:c.nhgMog&&nhg==="nee",l:"Check of u NHG kunt aanvragen",detail:"Hypotheek valt onder €435k grens — rentekorting ~0.4%",prio:"middel"},
+                {check:!["A++","A+","A","B","C"].includes(energieLabel),l:"Verduurzaam de woning",detail:`Label ${energieLabel} kost ${€(c.energieExtra)}/mnd extra`,prio:"middel"},
+                {check:c.wqBruto>42,l:"Verlaag de hypotheeklast (extra aflossen/oversluiten)",detail:`Woonquote ${pct(c.wqBruto)} overschrijdt 42% norm`,prio:"hoog"},
+                {check:c.stressWq>55,l:"Verlaag renterisico voor volgende rentevaste periode",detail:`Bij ${stressRente}% rente: woonquote ${pct(c.stressWq)}`,prio:"middel"},
+                {check:c.box3Btg>1000,l:"Overweeg box 3 optimalisatie",detail:`${€(c.box3Btg)}/jr belasting — evt. vermogen naar groene fondsen`,prio:"laag"},
+              ].filter(a=>a.check).map((a,i)=>(
+                <div key={i} style={{display:"flex",gap:10,padding:"10px 13px",background:C.s2,borderRadius:9,marginBottom:7,alignItems:"flex-start"}}>
+                  <span style={{fontSize:16,marginTop:1}}>☐</span>
+                  <div style={{flex:1}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}><span style={{fontSize:12,fontWeight:600,color:C.text}}>{a.l}</span><Prio level={a.prio}/></div>
+                    <div style={{fontSize:11,color:C.sub}}>{a.detail}</div>
+                  </div>
+                </div>
+              ))}
+              {[orv1==="nee"&&ink2>0,aov==="nee"&&(dv1==="zzp"||dv1==="flex"),c.bufMnd<3,c.wqBruto>42].every(v=>!v)&&
+                <Alert type="ok">Alle urgente actiepunten zijn afgevinkt. Goed geregeld!</Alert>}
+            </Sec>
+
+            {/* Tijdlijn */}
+            <Sec title="📅 Financiële tijdlijn" delay={100}>
+              <div style={{position:"relative",paddingLeft:24}}>
+                <div style={{position:"absolute",left:8,top:0,bottom:0,width:2,background:C.border,borderRadius:2}}/>
+                {[
+                  {jaar:0,l:"Vandaag",sub:`Restschuld: ${€(c.rsTotaal)} · Woonquote: ${pct(c.wqBruto)}`,color:C.gold},
+                  ...(rvp-betaald>0?[{jaar:rvp-betaald,l:`Renteverlenging (${new Date().getFullYear()+rvp-betaald})`,sub:`Restschuld: ${€(c.rsNvp)} · Verwachte nieuwe rente: ${nieuweRente}%`,color:c.nvpDelta>200?C.red:C.yellow}]:[]),
+                  ...(erfpacht==="ja"&&epHerziening>0?[{jaar:epHerziening,l:`Erfpacht herziening (${new Date().getFullYear()+epHerziening})`,sub:`Canon stijgt van ${€(c.canonMnd)} naar ${€(c.canonNieuw)}/mnd`,color:C.orange}]:[]),
+                  ...(kinderen>0&&c.jaarTotStudie>0?[{jaar:c.jaarTotStudie,l:`Studie kinderen start (~${new Date().getFullYear()+c.jaarTotStudie})`,sub:`Kosten: ${€(c.studieKosten)}/mnd per kind`,color:C.purple}]:[]),
+                  ...(c.jTotP>0?[{jaar:c.jTotP,l:`Pensioen (${new Date().getFullYear()+c.jTotP})`,sub:c.rsPensioen===0?`Hypotheek afgelost ✓`:`Restschuld: ${€(c.rsPensioen)} · Woonquote: ${pct(c.pensWq)}`,color:c.rsPensioen===0?C.green:c.pensWq>38?C.red:C.yellow}]:[]),
+                  {jaar:lp-betaald,l:`Einde hypotheek (${new Date().getFullYear()+lp-betaald})`,sub:aflVrij>0?`Aflossingsvrij deel open: ${€(aflVrij)}`:"Hypotheek volledig afgelost",color:aflVrij>0?C.red:C.green},
+                ].sort((a,b)=>a.jaar-b.jaar).map((e,i)=>(
+                  <div key={i} style={{position:"relative",paddingLeft:20,paddingBottom:18}}>
+                    <div style={{position:"absolute",left:-8,top:4,width:10,height:10,borderRadius:"50%",background:e.color,boxShadow:`0 0 8px ${e.color}66`}}/>
+                    <div style={{fontSize:11,fontWeight:700,color:e.color}}>{e.jaar===0?"Nu":e.jaar<=1?`Over ${Math.round(e.jaar*12)} maanden`:`Over ${e.jaar} jaar`} — {e.l}</div>
+                    <div style={{fontSize:11,color:C.sub,marginTop:2}}>{e.sub}</div>
+                  </div>
+                ))}
+              </div>
+            </Sec>
+
+            {/* Jaarlijkse hercheck */}
+            <Sec title="🔄 Jaarlijkse hercheck — wat controleren?" delay={150}>
+              <div style={{display:"grid",gap:6}}>
+                {["Actuele woningwaarde en LTV herberekenen","Controleer of NHG inmiddels mogelijk is (na dalende restschuld)","Vergelijk uw rente met de markt — oversluiten zinvol?","Update spaarbuffer aan de hand van nieuwe maandlasten","Herzie verzekeringsbedragen ORV/AOV na loonstijging","Check of aflossingsvrij deel nog past binnen uw situatie","Bereken effect van eventuele loonsverhogingen op woonquote","Controleer gemeentelijke lasten en opstalpremie voor aanpassing"].map((l,i)=>(
+                  <div key={i} style={{display:"flex",gap:10,padding:"8px 12px",background:C.s2,borderRadius:8,fontSize:12,color:C.sub}}>
+                    <span style={{color:C.teal}}>→</span>{l}
+                  </div>
+                ))}
+              </div>
+            </Sec>
+
+          </div>
+        )}
+
+      </div>
+
+      <div style={{borderTop:`1px solid ${C.border}`,padding:"11px 14px",textAlign:"center",fontSize:10,color:C.muted}}>
+        ⚠️ Informatief hulpmiddel — geen financieel advies. Neem voor persoonlijk advies contact op met een AFM-geregistreerde hypotheekadviseur. Alle berekeningen zijn indicatief.
+      </div>
+    </div>
+  );
+}
+
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
